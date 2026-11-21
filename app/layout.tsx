@@ -1,24 +1,32 @@
 import type { Metadata } from 'next';
-import { Plus_Jakarta_Sans, Vazirmatn, JetBrains_Mono } from 'next/font/google';
+import {
+  Plus_Jakarta_Sans,
+  Vazirmatn,
+  JetBrains_Mono,
+  Noto_Nastaliq_Urdu,
+} from 'next/font/google';
 import './globals.css';
 
 const plusJakarta = Plus_Jakarta_Sans({
   subsets: ['latin'],
-  weight: ['400', '500', '600', '700'],
   variable: '--font-sans',
   display: 'swap',
 });
 
 const vazirmatn = Vazirmatn({
   subsets: ['arabic', 'latin'],
-  weight: ['400', '500', '600', '700'],
   variable: '--font-farsi',
+  display: 'swap',
+});
+
+const notoNastaliq = Noto_Nastaliq_Urdu({
+  subsets: ['arabic', 'latin'],
+  variable: '--font-nastaliq',
   display: 'swap',
 });
 
 const jetbrainsMono = JetBrains_Mono({
   subsets: ['latin'],
-  weight: ['400', '500', '600'],
   variable: '--font-mono',
   display: 'swap',
 });
@@ -45,7 +53,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html
       lang="en"
-      className={`${plusJakarta.variable} ${vazirmatn.variable} ${jetbrainsMono.variable} dark`}
+      className={`${plusJakarta.variable} ${vazirmatn.variable} ${notoNastaliq.variable} ${jetbrainsMono.variable} dark`}
     >
       <body
         className="bg-[#0B0D11] text-zinc-100 font-sans antialiased selection:bg-amber-500/30 selection:text-amber-100"

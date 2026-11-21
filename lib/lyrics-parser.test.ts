@@ -5,13 +5,17 @@ import {
   parseSrtTime,
   formatSrtTime,
   parseSrt,
+  parseTrackSrt,
+  mergeTrackSrtIntoCues,
+  validateLyricCues,
+  splitCueAtTime,
+  duplicateCue,
   parsePlainLyrics,
   stampCueSync,
   updateCueTiming,
   shiftAllCues,
   exportToSrt,
   getActiveCueAtTime,
-  normalizeTranscribedCues,
   SAMPLE_MULTI_LYRICS,
 } from './lyrics-parser';
 
@@ -48,6 +52,83 @@ Good night`;
   assert.equal(cues[0].roman, 'Salaam donya');
   assert.equal(cues[0].english, 'Hello world');
   assert.equal(cues[1].startTime, 5);
+});
+
+test('parseTrackSrt parses single-track SRT and reports malformed timestamp warnings', () => {
+  const srt = `1
+00:00:02,000 --> 00:00:05,000
+سلام به تو
+
+2
+bad-timestamp-line
+سلام دوم`;
+
+  const res = parseTrackSrt(srt, 'farsi');
+  assert.equal(res.cues.length, 1);
+  assert.equal(res.cues[0].track, 'farsi');
+  assert.equal(res.cues[0].text, 'سلام به تو');
+  assert.equal(res.warnings.length, 1);
+  assert.equal(res.warnings[0].kind, 'invalid-timestamp');
+});
+
+test('mergeTrackSrtIntoCues matches multi-SRT files by time proximity and flags unmatched cues', () => {
+  const farsi = parseTrackSrt(
+    `1
+00:00:02,000 --> 00:00:05,000
+سلام دنیا
+
+2
+00:00:06,000 --> 00:00:09,000
+شب آرام`,
+    'farsi'
+  );
+  const roman = parseTrackSrt(
+    `1
+00:00:02,200 --> 00:00:05,100
+Salaam donya
+
+2
+00:00:15,000 --> 00:00:18,000
+Unmatched roman line`,
+    'romanized'
+  );
+
+  const step1 = mergeTrackSrtIntoCues([], farsi.cues, 'farsi');
+  assert.equal(step1.cues.length, 2);
+
+  const step2 = mergeTrackSrtIntoCues(step1.cues, roman.cues, 'romanized');
+  assert.equal(step2.cues.length, 3);
+  assert.equal(step2.cues[0].primary, 'سلام دنیا');
+  assert.equal(step2.cues[0].roman, 'Salaam donya');
+  assert.ok(step2.unmatchedCount >= 1);
+  assert.equal(step2.cues[2].roman, 'Unmatched roman line');
+  assert.deepEqual(step2.cues[2].unmatchedTracks, ['romanized']);
+});
+
+test('validateLyricCues detects overlapping and out-of-duration cues', () => {
+  const cues = [
+    { id: 'c1', startTime: 1, endTime: 5, primary: 'Line 1', roman: '', english: '' },
+    { id: 'c2', startTime: 4, endTime: 12, primary: 'Line 2', roman: '', english: '' },
+  ];
+  const warnings = validateLyricCues(cues, 10);
+  const kinds = new Set(warnings.map((w) => w.kind));
+  assert.ok(kinds.has('overlap'));
+  assert.ok(kinds.has('out-of-duration'));
+});
+
+test('splitCueAtTime and duplicateCue edit cues cleanly', () => {
+  const cues = [
+    { id: 'c1', startTime: 2, endTime: 6, primary: 'خط اول', roman: 'Khat', english: 'Line' },
+  ];
+  const split = splitCueAtTime(cues, 'c1', 4);
+  assert.equal(split.length, 2);
+  assert.equal(split[0].endTime, 4);
+  assert.equal(split[1].startTime, 4);
+  assert.equal(split[1].endTime, 6);
+
+  const dup = duplicateCue(split, split[0].id);
+  assert.equal(dup.length, 3);
+  assert.equal(dup[2].startTime, 4.05);
 });
 
 test('parsePlainLyrics parses pipe-separated Farsi | Roman | English lyrics', () => {
@@ -100,7 +181,7 @@ test('stampCueSync stamps singer time and closes previous cue cleanly', () => {
   assert.equal(step2.nextIndex, 2);
 });
 
-test('updateCueTiming, shiftAllCues, and getActiveCueAtTime behave deterministically', () => {
+test('updateCueTiming, shiftAllCues, and getActiveCueAtTime with globalOffset behave deterministically', () => {
   const cues = parsePlainLyrics('A\nB', { mode: 'single', totalDuration: 10 });
   const updated = updateCueTiming(cues, cues[0].id, 1, 4);
   assert.equal(updated[0].startTime, 1);
@@ -110,9 +191,10 @@ test('updateCueTiming, shiftAllCues, and getActiveCueAtTime behave deterministic
   assert.equal(shifted[0].startTime, 1.5);
   assert.equal(shifted[0].endTime, 4.5);
 
-  const active = getActiveCueAtTime(shifted, 2.0);
-  assert.equal(active?.primary, 'A');
+  assert.equal(getActiveCueAtTime(shifted, 2.0)?.primary, 'A');
   assert.equal(getActiveCueAtTime(shifted, 0.2), null);
+  // Global offset +1.5s moves adjustedTime to 1.7s, matching A [1.5..4.5]
+  assert.equal(getActiveCueAtTime(shifted, 0.2, 1.5)?.primary, 'A');
 });
 
 test('exportToSrt respects enabled language track filters', () => {
@@ -130,50 +212,6 @@ test('exportToSrt respects enabled language track filters', () => {
   });
   assert.match(srtFarsiOnly, /فارسی/);
   assert.doesNotMatch(srtFarsiOnly, /Farsi/);
-});
-
-test('normalizeTranscribedCues clamps timestamps, sorts, and prevents overlaps', () => {
-  const normalized = normalizeTranscribedCues(
-    [
-      {
-        startTime: 6.5,
-        endTime: 14.0,
-        primary: '  خط دوم  ',
-        roman: 'Khatte dovvom',
-        english: 'Second line',
-      },
-      {
-        startTime: -1,
-        endTime: 7.5,
-        primary: 'خط اول',
-        roman: 'Khatte avval',
-        english: 'First line',
-      },
-      {
-        startTime: 2,
-        endTime: 3,
-        primary: '   ',
-        roman: '',
-        english: '',
-      },
-    ],
-    10
-  );
-
-  assert.equal(normalized.length, 2);
-  assert.equal(normalized[0].startTime, 0);
-  assert.equal(normalized[0].endTime, 6.5);
-  assert.equal(normalized[1].startTime, 6.5);
-  assert.equal(normalized[1].endTime, 10);
-  assert.equal(normalized[1].primary, 'خط دوم');
-
-  const shiftedChunk = normalizeTranscribedCues(
-    [{ startTime: 2, endTime: 5, primary: 'Chunk 2 line' }],
-    200,
-    150
-  );
-  assert.equal(shiftedChunk[0].startTime, 152);
-  assert.equal(shiftedChunk[0].endTime, 155);
 });
 
 test('parsePlainLyrics auto-detects multi-verse Farsi stanzas as 16 individual lines', () => {

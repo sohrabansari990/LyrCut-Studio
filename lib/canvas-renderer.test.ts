@@ -4,6 +4,7 @@ import {
   getResolutionForRatio,
   computeFitRect,
   computeCueOpacity,
+  quantizeBlurStep,
 } from './canvas-renderer';
 import { LyricCue } from './lyrics-parser';
 
@@ -44,4 +45,12 @@ test('computeCueOpacity smoothly fades in and out within cue bounds', () => {
 
   const zeroCue: LyricCue = { ...cue, startTime: 0, endTime: 4 };
   assert.equal(computeCueOpacity(zeroCue, 0, 0.16, false), 1);
+});
+
+test('quantizeBlurStep snaps blur radius to half-pixel buckets and caps at 12px', () => {
+  assert.equal(quantizeBlurStep(0.1), 0);
+  assert.equal(quantizeBlurStep(Number.NaN), 0);
+  assert.equal(quantizeBlurStep(2.38), 2.5);
+  assert.equal(quantizeBlurStep(2.12), 2);
+  assert.equal(quantizeBlurStep(18.5), 12);
 });

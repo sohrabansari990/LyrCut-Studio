@@ -4,6 +4,7 @@
 @theme {
   --font-sans: var(--font-sans), "Plus Jakarta Sans", system-ui, sans-serif;
   --font-farsi: var(--font-farsi), "Vazirmatn", system-ui, sans-serif;
+  --font-nastaliq: var(--font-nastaliq), "Noto Nastaliq Urdu", "IranNastaliq", var(--font-farsi), system-ui, sans-serif;
   --font-mono: var(--font-mono), "JetBrains Mono", monospace;
 }
 

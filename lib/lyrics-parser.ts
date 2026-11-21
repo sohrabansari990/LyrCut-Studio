@@ -2,6 +2,29 @@ export type AspectRatio = '16:9' | '9:16';
 
 export type MediaFitMode = 'cover' | 'contain-blur' | 'contain-black';
 
+export type LyricTrackType = 'farsi' | 'romanized' | 'english';
+
+export type LyricSourceType =
+  | 'sample'
+  | 'manual'
+  | 'farsi-srt'
+  | 'romanized-srt'
+  | 'english-srt'
+  | 'multi-srt';
+
+export interface SrtValidationWarning {
+  id: string;
+  kind:
+    | 'invalid-timestamp'
+    | 'overlap'
+    | 'empty-cue'
+    | 'out-of-duration'
+    | 'unmatched-track';
+  message: string;
+  cueId?: string;
+  track?: LyricTrackType;
+}
+
 export interface WordTiming {
   word: string;
   startTime: number;
@@ -13,11 +36,23 @@ export interface LyricCue {
   id: string;
   startTime: number; // seconds
   endTime: number; // seconds
-  primary: string; // e.g., Farsi or main lyric line
-  roman: string; // e.g., Romanized / Finglish
-  english: string; // e.g., English translation
-  words?: WordTiming[]; // optional word-level forced alignment offsets
-  stanzaIndex?: number; // preserves blank-line stanza grouping for alignment
+  primary: string; // Farsi / Dari or main lyric line
+  roman: string; // Romanized / Finglish
+  english: string; // English translation
+  sourceStartTime?: number; // original SRT start before manual/global tweaks
+  sourceEndTime?: number;
+  unmatchedTracks?: LyricTrackType[];
+  words?: WordTiming[];
+  confidence?: number;
+  stanzaIndex?: number;
+}
+
+export interface TrackCueItem {
+  id: string;
+  startTime: number;
+  endTime: number;
+  text: string;
+  track: LyricTrackType;
 }
 
 export interface EnabledTracks {
@@ -42,7 +77,23 @@ export interface LyricStyleConfig {
   primaryColor: string;
   secondaryColor: string;
   showSafeZones: boolean;
+  farsiFont: string;
+  latinFont: string;
 }
+
+export const FARSI_FONT_OPTIONS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: 'Noto Nastaliq Urdu (Nastaliq)', value: 'Noto Nastaliq Urdu' },
+  { label: 'IranNastaliq (Local System)', value: 'IranNastaliq' },
+  { label: 'Vazirmatn (Modern Persian)', value: 'Vazirmatn' },
+  { label: 'B Nazanin (Classic Persian)', value: 'B Nazanin' },
+];
+
+export const LATIN_FONT_OPTIONS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: 'Plus Jakarta Sans', value: 'Plus Jakarta Sans' },
+  { label: 'Inter / System Sans', value: 'system-ui' },
+  { label: 'Georgia Serif', value: 'Georgia' },
+  { label: 'JetBrains Mono', value: 'JetBrains Mono' },
+];
 
 const PERSIAN_ARABIC_REGEX = /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/;
 
@@ -66,6 +117,9 @@ export function parseSrtTime(timeStr: string): number {
   const hours = Number(match[1]);
   const minutes = Number(match[2]);
   const seconds = Number(match[3]);
+  if (minutes > 59 || seconds > 59) {
+    throw new Error(`Out-of-range SRT timestamp: "${timeStr}"`);
+  }
   const millis = match[4] ? Number(match[4].padEnd(3, '0')) : 0;
   return hours * 3600 + minutes * 60 + seconds + millis / 1000;
 }
@@ -76,7 +130,6 @@ export function formatSrtTime(totalSeconds: number): string {
   const minutes = Math.floor((safe % 3600) / 60);
   const seconds = Math.floor(safe % 60);
   const millis = Math.round((safe - Math.floor(safe)) * 1000);
-  // Handle rounding edge case where millis === 1000
   const adjustedSec = millis === 1000 ? seconds + 1 : seconds;
   const adjustedMillis = millis === 1000 ? 0 : millis;
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(
@@ -97,7 +150,6 @@ export function formatTimecode(totalSeconds: number): string {
 
 export function parseTimecodeInput(value: string): number | null {
   const trimmed = value.trim();
-  // Accept MM:SS.cc or SS.cc or HH:MM:SS.mmm
   const colonParts = trimmed.split(':');
   if (colonParts.length === 1) {
     const num = Number(colonParts[0]);
@@ -154,7 +206,11 @@ function mapLinesToTracks(lines: string[]): {
 }
 
 export function parseSrt(content: string): LyricCue[] {
-  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  const normalized = content
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
   if (!normalized) return [];
 
   const blocks = normalized.split(/\n{2,}/);
@@ -167,7 +223,6 @@ export function parseSrt(content: string): LyricCue[] {
       .filter((l) => l.length > 0);
     if (rawLines.length === 0) continue;
 
-    // Find timestamp line (with or without leading index line)
     const timeLineIdx = rawLines.findIndex((line) => line.includes('-->'));
     if (timeLineIdx === -1) continue;
 
@@ -196,11 +251,321 @@ export function parseSrt(content: string): LyricCue[] {
       id: makeCueId(cues.length),
       startTime,
       endTime,
+      sourceStartTime: startTime,
+      sourceEndTime: endTime,
       ...tracks,
     });
   }
 
   return cues.sort((a, b) => a.startTime - b.startTime);
+}
+
+/**
+ * Parses a single-language SRT file in the browser, returning cues tagged with its track
+ * plus non-blocking validation warnings for malformed timestamps, reversed spans, or empty text.
+ */
+export function parseTrackSrt(
+  content: string,
+  track: LyricTrackType
+): {
+  cues: TrackCueItem[];
+  warnings: SrtValidationWarning[];
+} {
+  const normalized = content
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+  if (!normalized) {
+    return {
+      cues: [],
+      warnings: [
+        {
+          id: `warn-empty-${track}`,
+          kind: 'empty-cue',
+          track,
+          message: `The uploaded ${track} SRT file was empty.`,
+        },
+      ],
+    };
+  }
+
+  const blocks = normalized.split(/\n{2,}/);
+  const cues: TrackCueItem[] = [];
+  const warnings: SrtValidationWarning[] = [];
+
+  blocks.forEach((block, bIdx) => {
+    const rawLines = block
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    if (rawLines.length === 0) return;
+
+    const timeLineIdx = rawLines.findIndex((line) => line.includes('-->'));
+    if (timeLineIdx === -1) {
+      warnings.push({
+        id: `warn-ts-missing-${track}-${bIdx}`,
+        kind: 'invalid-timestamp',
+        track,
+        message: `Block #${bIdx + 1} (${track} SRT) is missing a valid "-->" timestamp line.`,
+      });
+      return;
+    }
+
+    const timeLine = rawLines[timeLineIdx];
+    const [startRaw, endRaw] = timeLine.split('-->').map((s) => s.trim());
+    if (!startRaw || !endRaw) {
+      warnings.push({
+        id: `warn-ts-empty-${track}-${bIdx}`,
+        kind: 'invalid-timestamp',
+        track,
+        message: `Block #${bIdx + 1} (${track} SRT) has an incomplete timestamp range.`,
+      });
+      return;
+    }
+
+    let startTime = 0;
+    let endTime = 0;
+    try {
+      startTime = parseSrtTime(startRaw);
+      endTime = parseSrtTime(endRaw.split(/\s+/)[0]);
+    } catch {
+      warnings.push({
+        id: `warn-ts-bad-${track}-${bIdx}`,
+        kind: 'invalid-timestamp',
+        track,
+        message: `Block #${bIdx + 1} (${track} SRT) has invalid timestamp "${timeLine}".`,
+      });
+      return;
+    }
+
+    if (endTime <= startTime) {
+      warnings.push({
+        id: `warn-ts-order-${track}-${bIdx}`,
+        kind: 'invalid-timestamp',
+        track,
+        message: `Block #${bIdx + 1} (${track} SRT) ends before it starts (${formatTimecode(startTime)} -> ${formatTimecode(endTime)}). Auto-clamped to +0.5s.`,
+      });
+      endTime = Number((startTime + 0.5).toFixed(3));
+    }
+
+    const text = rawLines.slice(timeLineIdx + 1).join(' ').trim();
+    if (!text) {
+      warnings.push({
+        id: `warn-empty-cue-${track}-${bIdx}`,
+        kind: 'empty-cue',
+        track,
+        message: `Cue #${bIdx + 1} (${track} SRT) at ${formatTimecode(startTime)} has empty lyric text.`,
+      });
+    }
+
+    cues.push({
+      id: `${track}-${cues.length + 1}-${Math.random().toString(36).slice(2, 6)}`,
+      startTime,
+      endTime,
+      text,
+      track,
+    });
+  });
+
+  cues.sort((a, b) => a.startTime - b.startTime);
+  return { cues, warnings };
+}
+
+function setTrackField(cue: LyricCue, track: LyricTrackType, text: string): LyricCue {
+  if (track === 'farsi') return { ...cue, primary: text };
+  if (track === 'romanized') return { ...cue, roman: text };
+  return { ...cue, english: text };
+}
+
+/**
+ * Merges a single-language SRT track into existing project cues by timestamp overlap or
+ * time proximity (`toleranceSec`), preserving unmatched cues cleanly and marking unmatched tracks.
+ */
+export function mergeTrackSrtIntoCues(
+  existingCues: LyricCue[],
+  incoming: TrackCueItem[],
+  track: LyricTrackType,
+  toleranceSec = 0.65
+): { cues: LyricCue[]; unmatchedCount: number } {
+  if (incoming.length === 0) {
+    return { cues: existingCues, unmatchedCount: 0 };
+  }
+
+  // If project currently has no cues (or user replaced all cues on fresh single-track import),
+  // build directly from incoming track.
+  if (existingCues.length === 0) {
+    const fresh: LyricCue[] = incoming.map((item, idx) => {
+      const base: LyricCue = {
+        id: makeCueId(idx),
+        startTime: item.startTime,
+        endTime: item.endTime,
+        sourceStartTime: item.startTime,
+        sourceEndTime: item.endTime,
+        primary: '',
+        roman: '',
+        english: '',
+      };
+      return setTrackField(base, track, item.text);
+    });
+    return { cues: fresh, unmatchedCount: 0 };
+  }
+
+  // Clear previous text for this specific track before merging the new file for this track
+  const working: LyricCue[] = existingCues.map((c) => {
+    const cleared = setTrackField(c, track, '');
+    return {
+      ...cleared,
+      unmatchedTracks: cleared.unmatchedTracks?.filter((t) => t !== track),
+    };
+  });
+
+  const matchedCueIndices = new Set<number>();
+  let unmatchedCount = 0;
+
+  for (const item of incoming) {
+    let bestIdx = -1;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < working.length; i++) {
+      if (matchedCueIndices.has(i)) continue;
+      const target = working[i];
+      const overlap = Math.min(target.endTime, item.endTime) - Math.max(target.startTime, item.startTime);
+      const startDiff = Math.abs(target.startTime - item.startTime);
+      const midDiff = Math.abs(
+        (target.startTime + target.endTime) / 2 - (item.startTime + item.endTime) / 2
+      );
+
+      if (overlap > 0.1 || startDiff <= toleranceSec || midDiff <= toleranceSec) {
+        // Lower score is better match
+        const score = startDiff * 0.7 + midDiff * 0.3 - Math.max(0, overlap) * 0.5;
+        if (score < bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+    }
+
+    if (bestIdx !== -1) {
+      matchedCueIndices.add(bestIdx);
+      working[bestIdx] = setTrackField(working[bestIdx], track, item.text);
+    } else {
+      unmatchedCount++;
+      let created: LyricCue = {
+        id: makeCueId(working.length),
+        startTime: item.startTime,
+        endTime: item.endTime,
+        sourceStartTime: item.startTime,
+        sourceEndTime: item.endTime,
+        primary: '',
+        roman: '',
+        english: '',
+        unmatchedTracks: [track],
+      };
+      created = setTrackField(created, track, item.text);
+      working.push(created);
+    }
+  }
+
+  // Flag existing cues that have text in other tracks but were missed by incoming multi-SRT merge
+  for (let i = 0; i < working.length; i++) {
+    if (!matchedCueIndices.has(i)) {
+      const c = working[i];
+      const hasOtherText = Boolean(c.primary.trim() || c.roman.trim() || c.english.trim());
+      if (hasOtherText && !setTrackField({ ...c }, track, '').unmatchedTracks?.includes(track)) {
+        const existingOtherTrackContent =
+          (track !== 'farsi' && c.primary.trim()) ||
+          (track !== 'romanized' && c.roman.trim()) ||
+          (track !== 'english' && c.english.trim());
+        if (existingOtherTrackContent) {
+          unmatchedCount++;
+          c.unmatchedTracks = Array.from(new Set([...(c.unmatchedTracks ?? []), track]));
+        }
+      }
+    }
+  }
+
+  const cleaned = working
+    .filter((c) => Boolean(c.primary.trim() || c.roman.trim() || c.english.trim()))
+    .sort((a, b) => a.startTime - b.startTime);
+
+  return { cues: cleaned, unmatchedCount };
+}
+
+/**
+ * Validates cues for overlaps, empty text, cues beyond song duration, and unmatched tracks.
+ */
+export function validateLyricCues(
+  cues: LyricCue[],
+  songDuration: number,
+  parseWarnings: SrtValidationWarning[] = []
+): SrtValidationWarning[] {
+  const warnings: SrtValidationWarning[] = [...parseWarnings];
+  const sorted = [...cues].sort((a, b) => a.startTime - b.startTime);
+
+  for (let i = 0; i < sorted.length; i++) {
+    const cue = sorted[i];
+    const hasAnyText = Boolean(
+      cue.primary.trim() || cue.roman.trim() || cue.english.trim()
+    );
+    if (!hasAnyText) {
+      warnings.push({
+        id: `val-empty-${cue.id}`,
+        kind: 'empty-cue',
+        cueId: cue.id,
+        message: `Line ${i + 1} (${formatTimecode(cue.startTime)}) has no lyric text.`,
+      });
+    }
+
+    if (cue.startTime < 0 || (songDuration > 0 && cue.endTime > songDuration + 0.05)) {
+      warnings.push({
+        id: `val-dur-${cue.id}`,
+        kind: 'out-of-duration',
+        cueId: cue.id,
+        message: `Line ${i + 1} (${formatTimecode(cue.startTime)}–${formatTimecode(
+          cue.endTime
+        )}) extends outside song duration (${formatTimecode(songDuration)}).`,
+      });
+    }
+
+    if (cue.endTime <= cue.startTime) {
+      warnings.push({
+        id: `val-order-${cue.id}`,
+        kind: 'invalid-timestamp',
+        cueId: cue.id,
+        message: `Line ${i + 1} has invalid duration (${formatTimecode(
+          cue.startTime
+        )} >= ${formatTimecode(cue.endTime)}).`,
+      });
+    }
+
+    if (i < sorted.length - 1) {
+      const next = sorted[i + 1];
+      if (cue.endTime - next.startTime > 0.02) {
+        warnings.push({
+          id: `val-overlap-${cue.id}`,
+          kind: 'overlap',
+          cueId: cue.id,
+          message: `Line ${i + 1} overlaps Line ${i + 2} by ${(
+            cue.endTime - next.startTime
+          ).toFixed(2)}s.`,
+        });
+      }
+    }
+
+    if (cue.unmatchedTracks && cue.unmatchedTracks.length > 0) {
+      warnings.push({
+        id: `val-unmatched-${cue.id}`,
+        kind: 'unmatched-track',
+        cueId: cue.id,
+        message: `Line ${i + 1} (${formatTimecode(
+          cue.startTime
+        )}) could not match ${cue.unmatchedTracks.join(', ')} timestamps.`,
+      });
+    }
+  }
+
+  return warnings;
 }
 
 export function parsePlainLyrics(
@@ -210,7 +575,11 @@ export function parsePlainLyrics(
     totalDuration?: number;
   } = {}
 ): LyricCue[] {
-  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  const normalized = content
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
   if (!normalized) return [];
 
   if (isSrtContent(normalized)) {
@@ -239,9 +608,6 @@ export function parsePlainLyrics(
         )
         .filter((lines) => lines.length > 0);
 
-      // Only treat stanzas as multi-language translations if blocks mix scripts (RTL + LTR)
-      // and have <= 3 lines per block. Same-script verse stanzas (e.g. 4-line Farsi verses)
-      // must stay single-language cues (one cue per line).
       const mixedBlocks = blocks.filter((lines) => {
         if (lines.length < 2 || lines.length > 3) return false;
         const dirs = new Set(lines.map((l) => detectScriptDirection(l)));
@@ -290,7 +656,6 @@ export function parsePlainLyrics(
           .map((l) => l.trim())
           .filter(Boolean);
         if (lines.length === 0) return;
-        // If a stanza has more lines than groupSize, chunk it cleanly
         if (lines.length <= 3) {
           entries.push({ ...mapLinesToTracks(lines), stanzaIndex: sIdx });
         } else {
@@ -344,11 +709,13 @@ export function parsePlainLyrics(
 
 export function getActiveCueAtTime(
   cues: LyricCue[],
-  currentTime: number
+  currentTime: number,
+  globalOffset = 0
 ): LyricCue | null {
+  const adjustedTime = currentTime + globalOffset;
   for (let i = 0; i < cues.length; i++) {
     const cue = cues[i];
-    if (currentTime >= cue.startTime && currentTime < cue.endTime) {
+    if (adjustedTime >= cue.startTime && adjustedTime < cue.endTime) {
       return cue;
     }
   }
@@ -368,7 +735,6 @@ export function stampCueSync(
   const clampedTime = Math.max(0, Math.min(currentTime, Math.max(0.2, totalDuration - 0.1)));
   const updated = cues.map((c) => ({ ...c }));
 
-  // Close previous cue right as this cue begins
   if (activeIndex > 0) {
     const prev = updated[activeIndex - 1];
     prev.endTime = Number(Math.max(prev.startTime + 0.25, clampedTime).toFixed(2));
@@ -377,14 +743,16 @@ export function stampCueSync(
   const current = updated[activeIndex];
   current.startTime = Number(clampedTime.toFixed(2));
 
-  // Ensure current cue ends cleanly after startTime
   const nextStart =
     activeIndex + 1 < updated.length
       ? updated[activeIndex + 1].startTime
       : totalDuration;
   const fallbackEnd = Math.min(
     totalDuration,
-    Math.max(current.startTime + 2.5, nextStart > current.startTime + 0.3 ? nextStart : current.startTime + 2.5)
+    Math.max(
+      current.startTime + 2.5,
+      nextStart > current.startTime + 0.3 ? nextStart : current.startTime + 2.5
+    )
   );
   current.endTime = Number(Math.max(current.startTime + 0.3, fallbackEnd).toFixed(2));
 
@@ -407,6 +775,55 @@ export function updateCueTiming(
     .sort((a, b) => a.startTime - b.startTime);
 }
 
+export function splitCueAtTime(
+  cues: LyricCue[],
+  id: string,
+  splitTime: number
+): LyricCue[] {
+  const idx = cues.findIndex((c) => c.id === id);
+  if (idx === -1) return cues;
+  const target = cues[idx];
+  const midpoint = (target.startTime + target.endTime) / 2;
+  const effectiveSplit =
+    splitTime > target.startTime + 0.2 && splitTime < target.endTime - 0.2
+      ? Number(splitTime.toFixed(2))
+      : Number(midpoint.toFixed(2));
+
+  if (effectiveSplit <= target.startTime + 0.15 || effectiveSplit >= target.endTime - 0.15) {
+    return cues;
+  }
+
+  const first: LyricCue = {
+    ...target,
+    endTime: effectiveSplit,
+  };
+  const second: LyricCue = {
+    ...target,
+    id: makeCueId(cues.length + 1),
+    startTime: effectiveSplit,
+  };
+  const next = [...cues];
+  next.splice(idx, 1, first, second);
+  return next.sort((a, b) => a.startTime - b.startTime);
+}
+
+export function duplicateCue(cues: LyricCue[], id: string): LyricCue[] {
+  const idx = cues.findIndex((c) => c.id === id);
+  if (idx === -1) return cues;
+  const target = cues[idx];
+  const len = Math.max(0.4, target.endTime - target.startTime);
+  const copyStart = Number((target.endTime + 0.05).toFixed(2));
+  const copy: LyricCue = {
+    ...target,
+    id: makeCueId(cues.length + 2),
+    startTime: copyStart,
+    endTime: Number((copyStart + len).toFixed(2)),
+  };
+  const next = [...cues];
+  next.splice(idx + 1, 0, copy);
+  return next.sort((a, b) => a.startTime - b.startTime);
+}
+
 export function shiftAllCues(cues: LyricCue[], offsetSeconds: number): LyricCue[] {
   return cues.map((cue) => {
     const duration = Math.max(0.2, cue.endTime - cue.startTime);
@@ -422,12 +839,13 @@ export function shiftAllCues(cues: LyricCue[], offsetSeconds: number): LyricCue[
 
 export function exportToSrt(
   cues: LyricCue[],
-  enabledTracks: EnabledTracks
+  enabledTracks: EnabledTracks,
+  globalOffset = 0
 ): string {
   const sorted = [...cues].sort((a, b) => a.startTime - b.startTime);
   const blocks: string[] = [];
 
-  sorted.forEach((cue, idx) => {
+  sorted.forEach((cue) => {
     const lines: string[] = [];
     if (enabledTracks.primary && cue.primary.trim()) lines.push(cue.primary.trim());
     if (enabledTracks.roman && cue.roman.trim()) lines.push(cue.roman.trim());
@@ -435,74 +853,16 @@ export function exportToSrt(
 
     if (lines.length === 0) return;
 
+    const start = Math.max(0, cue.startTime - globalOffset);
+    const end = Math.max(start + 0.2, cue.endTime - globalOffset);
     blocks.push(
-      `${blocks.length + 1}\n${formatSrtTime(cue.startTime)} --> ${formatSrtTime(
-        cue.endTime
+      `${blocks.length + 1}\n${formatSrtTime(start)} --> ${formatSrtTime(
+        end
       )}\n${lines.join('\n')}`
     );
   });
 
   return blocks.join('\n\n') + (blocks.length > 0 ? '\n' : '');
-}
-
-export interface RawTranscribedCue {
-  startTime: number;
-  endTime: number;
-  primary: string;
-  roman?: string;
-  english?: string;
-}
-
-export function normalizeTranscribedCues(
-  rawCues: RawTranscribedCue[],
-  totalDuration: number,
-  offsetSeconds = 0
-): LyricCue[] {
-  const safeTotal = Math.max(1, totalDuration);
-  const cleaned: LyricCue[] = [];
-
-  for (let i = 0; i < rawCues.length; i++) {
-    const item = rawCues[i];
-    const primary = (item.primary ?? '').trim();
-    const roman = (item.roman ?? '').trim();
-    const english = (item.english ?? '').trim();
-    if (!primary && !roman && !english) continue;
-
-    const rawStart = Number.isFinite(item.startTime)
-      ? item.startTime + offsetSeconds
-      : offsetSeconds;
-    const startTime = Number(
-      Math.max(0, Math.min(safeTotal - 0.3, rawStart)).toFixed(2)
-    );
-    const rawEnd = Number.isFinite(item.endTime)
-      ? item.endTime + offsetSeconds
-      : startTime + 2.5;
-    const endTime = Number(
-      Math.min(safeTotal, Math.max(startTime + 0.3, rawEnd)).toFixed(2)
-    );
-
-    cleaned.push({
-      id: `ai-cue-${i + 1}-${Math.random().toString(36).slice(2, 6)}`,
-      startTime,
-      endTime,
-      primary,
-      roman,
-      english,
-    });
-  }
-
-  cleaned.sort((a, b) => a.startTime - b.startTime);
-
-  // Prevent overlapping cues
-  for (let i = 0; i < cleaned.length - 1; i++) {
-    if (cleaned[i].endTime > cleaned[i + 1].startTime) {
-      cleaned[i].endTime = Number(
-        Math.max(cleaned[i].startTime + 0.2, cleaned[i + 1].startTime).toFixed(2)
-      );
-    }
-  }
-
-  return cleaned;
 }
 
 export const SAMPLE_MULTI_LYRICS = `شبِ یلدا وُ بارونِ پاییز | Shab-e yalda o baaroone paayeez | Solstice night and autumn rain
