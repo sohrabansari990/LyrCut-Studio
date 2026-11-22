@@ -473,15 +473,20 @@ export async function exportFullHdVideo(params: ExportVideoParams): Promise<Expo
       ? decodedAudioMap.get(primaryAudioUrl) ?? decodedAudioMap.values().next().value ?? null
       : null;
 
+    const exportAudioAnalysisMap = new Map<string, AudioBeatAnalysis>();
+    decodedAudioMap.forEach((buf, url) => {
+      if (buf.length > 0) {
+        exportAudioAnalysisMap.set(
+          url,
+          computeAudioAnalysisFromPcm(buf.getChannelData(0), buf.sampleRate, fps, 24)
+        );
+      }
+    });
+
     const exportAudioAnalysis: AudioBeatAnalysis | null =
-      decodedAudio && decodedAudio.length > 0
-        ? computeAudioAnalysisFromPcm(
-            decodedAudio.getChannelData(0),
-            decodedAudio.sampleRate,
-            fps,
-            16
-          )
-        : null;
+      (primaryAudioUrl ? exportAudioAnalysisMap.get(primaryAudioUrl) : null) ??
+      exportAudioAnalysisMap.values().next().value ??
+      null;
 
     const hasAudio = decodedAudioMap.size > 0 && Boolean(decodedAudio && decodedAudio.length > 0);
     const targetConfig = await selectWebCodecsTarget({
@@ -749,6 +754,24 @@ export async function exportFullHdVideo(params: ExportVideoParams): Promise<Expo
         frameMediaSource = loaded;
       }
 
+      let frameAudioAnalysis: AudioBeatAnalysis | null = exportAudioAnalysis;
+      let frameAudioAnalysisTime = t;
+      if (activeAudioClips.length > 0) {
+        const audioHits = getActiveAudioClipsAtTime(
+          activeAudioClips,
+          t,
+          mutedAudioSet
+        );
+        const primaryHit = audioHits.find((h) => h.gain > 0.001) ?? audioHits[0];
+        if (primaryHit) {
+          frameAudioAnalysis =
+            exportAudioAnalysisMap.get(primaryHit.clip.url) ?? exportAudioAnalysis;
+          frameAudioAnalysisTime = primaryHit.localAudioTime;
+        } else {
+          frameAudioAnalysis = null;
+        }
+      }
+
       renderFrameToCanvas({
         ctx,
         width,
@@ -770,7 +793,8 @@ export async function exportFullHdVideo(params: ExportVideoParams): Promise<Expo
         beatEffects: params.beatEffects ?? DEFAULT_BEAT_EFFECTS_CONFIG,
         effectClips: activeEffectClips,
         projectDuration: exportDuration,
-        audioAnalysis: exportAudioAnalysis,
+        audioAnalysis: frameAudioAnalysis,
+        audioAnalysisTime: frameAudioAnalysisTime,
         layers: params.layers,
         layerImages: params.layerImages,
         farsiFontFamily: params.farsiFontFamily,

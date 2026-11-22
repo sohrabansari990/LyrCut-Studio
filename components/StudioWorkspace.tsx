@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Download,
+  FilePlus2,
   FolderOpen,
   Subtitles,
   Layers,
@@ -97,7 +98,8 @@ import MediaBin, { MediaKind, UploadedMediaItem } from './MediaBin';
 import PreviewStage from './PreviewStage';
 import LyricsInspector, { EffectsSubTab, InspectorTab } from './LyricsInspector';
 import ExportModal from './ExportModal';
-import {
+import ProjectSetupModal, { NewProjectSettings } from './ProjectSetupModal';
+import TimelineEditor, {
   TimelineMarker,
   TimelineSelectionItem,
   TimelineSelectionTrack,
@@ -257,6 +259,26 @@ export default function StudioWorkspace() {
   >('preview');
   const [autoRipple, setAutoRipple] = useState<boolean>(true);
   const [isExportOpen, setIsExportOpen] = useState<boolean>(false);
+  const [projectName, setProjectName] = useState<string>('Untitled Lyric Video');
+  const [showProjectSetup, setShowProjectSetup] = useState<boolean>(true);
+  const [hasCreatedProject, setHasCreatedProject] = useState<boolean>(false);
+  const [audioAnalysisRevision, setAudioAnalysisRevision] = useState<number>(0);
+
+  const audioAnalysisMapRef = useRef<Map<string, AudioBeatAnalysis>>(new Map());
+  const audioAnalysisPendingRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (
+      typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('autostart') === '1'
+    ) {
+      const rafId = window.requestAnimationFrame(() => {
+        setShowProjectSetup(false);
+        setHasCreatedProject(true);
+      });
+      return () => window.cancelAnimationFrame(rafId);
+    }
+  }, []);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const hiddenVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -690,6 +712,26 @@ export default function StudioWorkspace() {
     const { latin: latinFont, farsi: farsiFont, nastaliq: nastaliqFont } =
       resolvedFontsRef.current;
 
+    // Resolve the exact active audio clip & local timestamp at playhead t so beat FX & visualizers
+    // stay 100% synced across multi-track, trimmed, shifted, or layered MP3/WAV tracks.
+    let frameAudioAnalysis: AudioBeatAnalysis | null = audioAnalysisRef.current;
+    let frameAudioAnalysisTime = t;
+    const allAudioClips = audioClipsRef.current;
+    if (allAudioClips.length > 0) {
+      const mutedSet = new Set(mutedAudioTracksRef.current);
+      const activeAudioHits = getActiveAudioClipsAtTime(allAudioClips, t, mutedSet);
+      const primaryAudioHit =
+        activeAudioHits.find((h) => h.gain > 0.001) ?? activeAudioHits[0] ?? null;
+      if (primaryAudioHit) {
+        frameAudioAnalysis =
+          audioAnalysisMapRef.current.get(primaryAudioHit.clip.url) ??
+          audioAnalysisRef.current;
+        frameAudioAnalysisTime = primaryAudioHit.localAudioTime;
+      } else {
+        frameAudioAnalysis = null;
+      }
+    }
+
     renderFrameToCanvas({
       ctx,
       width: targetW,
@@ -711,7 +753,8 @@ export default function StudioWorkspace() {
       scrollingConfig: scrollingConfigRef.current,
       beatEffects: beatEffectsRef.current,
       effectClips: effectClipsRef.current,
-      audioAnalysis: audioAnalysisRef.current,
+      audioAnalysis: frameAudioAnalysis,
+      audioAnalysisTime: frameAudioAnalysisTime,
       layers: layersRef.current,
       layerImages: layerImagesRef.current,
       selectedLayerId: selectedLayerIdRef.current,
@@ -824,8 +867,12 @@ export default function StudioWorkspace() {
 
     extractWaveformPeaks(activeAudioItem.url, 120).then((res) => {
       if (cancelled || !res) return;
+      audioAnalysisMapRef.current.set(activeAudioItem.url, res.beatAnalysis);
+      audioAnalysisRef.current = res.beatAnalysis;
       setWaveformPeaks(res.peaks);
       setAudioAnalysis(res.beatAnalysis);
+      setAudioAnalysisRevision((n) => n + 1);
+      drawCanvasFrame(currentTimeRef.current);
       if (res.duration > 1) {
         const roundedDur = Number(res.duration.toFixed(2));
         const prevDur = durationRef.current;
@@ -841,7 +888,37 @@ export default function StudioWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [activeAudioItem]);
+  }, [activeAudioItem, drawCanvasFrame]);
+
+  // Decode beat/frequency envelopes for EVERY unique audio clip on A1..An so multi-track Beat FX always fire
+  useEffect(() => {
+    let cancelled = false;
+    const uniqueUrls = Array.from(new Set(audioClips.map((c) => c.url)));
+    uniqueUrls.forEach((url) => {
+      if (
+        !url ||
+        audioAnalysisMapRef.current.has(url) ||
+        audioAnalysisPendingRef.current.has(url)
+      ) {
+        return;
+      }
+      audioAnalysisPendingRef.current.add(url);
+      extractWaveformPeaks(url, 120).then((res) => {
+        audioAnalysisPendingRef.current.delete(url);
+        if (cancelled || !res) return;
+        audioAnalysisMapRef.current.set(url, res.beatAnalysis);
+        if (!audioAnalysisRef.current) {
+          audioAnalysisRef.current = res.beatAnalysis;
+          setAudioAnalysis(res.beatAnalysis);
+        }
+        setAudioAnalysisRevision((n) => n + 1);
+        drawCanvasFrame(currentTimeRef.current);
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [audioClips, drawCanvasFrame]);
 
   // Re-draw canvas whenever non-playback visual props change while paused
   // (Skipped during active playback because the RAF loop drives every frame directly — prevents double-draws!)
@@ -859,8 +936,11 @@ export default function StudioWorkspace() {
     beatEffects,
     effectClips,
     visualClips,
+    audioClips,
     hiddenVisualTracks,
+    mutedAudioTracks,
     audioAnalysis,
+    audioAnalysisRevision,
     layers,
     selectedLayerId,
     snapGuides,
@@ -3325,6 +3405,10 @@ export default function StudioWorkspace() {
         timerScope: 'song',
         timerShowProgress: presetConfig.timerShowProgress,
         timerAccentColor: presetConfig.timerAccentColor,
+        timerBgColor: '#090B0F',
+        timerBgOpacity: 0,
+        timerBorderOpacity: 0,
+        timerShowDot: preset === 'stopwatch',
       };
 
       pushHistory(cloneSnapshot());
@@ -3400,6 +3484,320 @@ export default function StudioWorkspace() {
     setIsPlayerFocusMode((prev) => !prev);
   }, []);
 
+  const handleCreateProjectFromSetup = useCallback(
+    (settings: NewProjectSettings) => {
+      if (isPlayingRef.current) {
+        isPlayingRef.current = false;
+        setIsPlaying(false);
+        hiddenAudioRef.current?.pause();
+        hiddenVideoRef.current?.pause();
+      }
+      setProjectName(settings.name);
+      handleChangeRatio(settings.ratio);
+      setScrollingConfig((prev) => ({
+        ...prev,
+        enabled: settings.lyricMode === 'scrolling',
+      }));
+      if (settings.starterContent === 'blank') {
+        setCues([]);
+        setVisualClips([]);
+        setAudioClips([]);
+        setEffectClips([]);
+        setActiveVisualId(null);
+        setActiveAudioId(null);
+        setSelectedLayerId(null);
+        setSelectedCueId(null);
+        setLayers(createDefaultLayers(settings.ratio));
+        currentTimeRef.current = 0;
+        setCurrentTime(0);
+      }
+      setIsLeftCollapsed(false);
+      setIsRightCollapsed(false);
+      setIsPlayerFocusMode(false);
+      setHasCreatedProject(true);
+      setShowProjectSetup(false);
+    },
+    [handleChangeRatio]
+  );
+
+  const isPortraitLayout = ratio === '9:16' && !isPlayerFocusMode;
+
+  const sharedTimelineProps = {
+    currentTime,
+    duration,
+    globalOffset,
+    isMuted,
+    cues,
+    enabledTracks,
+    onToggleTrack: (track: keyof EnabledTracks) =>
+      setEnabledTracks((prev) => ({ ...prev, [track]: !prev[track] })),
+    visualVisible,
+    visualLocked,
+    onToggleVisualVisible: () => {
+      if (bgLayer) {
+        handleUpdateLayer(bgLayer.id, { visible: !bgLayer.visible });
+      }
+    },
+    onToggleVisualLocked: () => {
+      if (bgLayer) {
+        handleUpdateLayer(bgLayer.id, { locked: !bgLayer.locked });
+      }
+    },
+    visualTrackCount,
+    audioTrackCount,
+    hiddenVisualTracks,
+    lockedVisualTracks,
+    mutedAudioTracks,
+    lockedAudioTracks,
+    onAddVisualTrack: handleAddVisualTrack,
+    onRemoveVisualTrack: handleRemoveVisualTrack,
+    onAddAudioTrack: handleAddAudioTrack,
+    onRemoveAudioTrack: handleRemoveAudioTrack,
+    onToggleVisualTrackVisible: handleToggleVisualTrackVisible,
+    onToggleVisualTrackLocked: handleToggleVisualTrackLocked,
+    onToggleAudioTrackMuted: handleToggleAudioTrackMuted,
+    onToggleAudioTrackLocked: handleToggleAudioTrackLocked,
+    onSelectAllOnVisualTrack: handleSelectAllOnVisualTrack,
+    onSelectAllOnAudioTrack: handleSelectAllOnAudioTrack,
+    visualClips,
+    audioClips,
+    effectClips,
+    layers,
+    selectedLayerId,
+    onSelectLayer: handleSelectLayer,
+    onOpenAnimateForLayer: handleOpenAnimateForLayer,
+    onOpenBeatFx: handleOpenBeatFx,
+    onPreviewVisualClip: handlePreviewVisualClip,
+    onCommitVisualClip: handleCommitVisualClip,
+    onPreviewAudioClip: handlePreviewAudioClip,
+    onCommitAudioClip: handleCommitAudioClip,
+    onPreviewEffectClip: handlePreviewEffectClip,
+    onCommitEffectClip: handleCommitEffectClip,
+    selectedItems,
+    onSetSelectedItems: handleSetSelectedItems,
+    onSelectAllOnTrack: handleSelectAllOnTrack,
+    hasClipboard: Boolean(clipboard && clipboard.items.length > 0),
+    onCopySelected: handleCopySelected,
+    onCutSelected: handleCutSelected,
+    onPasteAtPlayhead: handlePasteAtPlayhead,
+    onDeleteSelected: handleDeleteSelected,
+    onSplitAtPlayhead: handleSplitAtPlayhead,
+    onClearAllLyrics: handleClearLyrics,
+    beatTimes: audioAnalysis?.beatTimes ?? [],
+    selectedCueId,
+    onSelectCue: (id: string | null, idx?: number) => {
+      setSelectedCueId(id);
+      if (typeof idx === 'number') setSyncTargetIndex(idx);
+    },
+    syncTargetIndex,
+    onSelectSyncTarget: setSyncTargetIndex,
+    onStampNextLine: handleStampNextLine,
+    onChangeGlobalOffset: setGlobalOffset,
+    onPreviewCueTiming: handlePreviewCueTiming,
+    onCommitCueTiming: handleCommitCueTiming,
+    waveformPeaks,
+    activeAudioName: activeAudioItem?.name ?? null,
+    markers,
+    onAddMarker: (time: number) => {
+      pushHistory(cloneSnapshot());
+      setMarkers((prev) => [
+        ...prev,
+        {
+          id: `marker-${Date.now()}`,
+          time: Number(time.toFixed(2)),
+          label: `M${prev.length + 1}`,
+        },
+      ]);
+    },
+    onRemoveMarker: (id: string) => {
+      pushHistory(cloneSnapshot());
+      setMarkers((prev) => prev.filter((m) => m.id !== id));
+    },
+    canUndo: historyPast.length > 0,
+    canRedo: historyFuture.length > 0,
+    onUndo: handleUndo,
+    onRedo: handleRedo,
+    autoRipple,
+    onToggleAutoRipple: () => setAutoRipple((v) => !v),
+    onToggleMute: handleToggleMute,
+    onSeek: handleSeek,
+  };
+
+  const renderMediaBinElement = () => (
+    <MediaBin
+      items={items}
+      activeVisualId={activeVisualId}
+      activeAudioId={activeAudioId}
+      mediaFit={mediaFit}
+      onUploadFiles={handleUploadFiles}
+      onSelectVisual={handleSelectVisual}
+      onSelectAudio={handleSelectAudio}
+      onAddVisualToTimeline={handleAddVisualToTimeline}
+      onAddVisualToUpperTrack={handleAddVisualToUpperTrack}
+      onAddAudioToTimeline={handleAddAudioToTimeline}
+      onAddAudioToNewTrack={handleAddAudioToNewTrack}
+      onAddImageAsOverlay={handleAddImageAsOverlay}
+      onRemoveItem={handleRemoveItem}
+      onChangeMediaFit={setMediaFit}
+      onCollapse={() => setIsLeftCollapsed(true)}
+    />
+  );
+
+  const renderPreviewStageElement = (hideTimeline: boolean) => (
+    <PreviewStage
+      canvasRef={canvasRef}
+      ratio={ratio}
+      onChangeRatio={handleChangeRatio}
+      showSafeZones={style.showSafeZones}
+      onToggleSafeZones={() =>
+        setStyle((s) => ({ ...s, showSafeZones: !s.showSafeZones }))
+      }
+      isLeftCollapsed={isLeftCollapsed}
+      isRightCollapsed={isRightCollapsed}
+      isPlayerFocusMode={isPlayerFocusMode}
+      onToggleLeftCollapsed={() => setIsLeftCollapsed((v) => !v)}
+      onToggleRightCollapsed={() => setIsRightCollapsed((v) => !v)}
+      onTogglePlayerFocusMode={handleTogglePlayerFocusMode}
+      scrollingEnabled={scrollingConfig.enabled}
+      onAutoBlendLayer={handleAutoBlendLayer}
+      onPreviewLayerPatch={handlePreviewLayerPatch}
+      onCommitLayerPatch={handleCommitLayerPatch}
+      onSetSnapGuides={setSnapGuides}
+      onToggleLayerLock={(id) => {
+        const target = layersRef.current.find((l) => l.id === id);
+        if (target) handleUpdateLayer(id, { locked: !target.locked });
+      }}
+      onToggleLayerVisible={(id) => {
+        const target = layersRef.current.find((l) => l.id === id);
+        if (target) handleUpdateLayer(id, { visible: !target.visible });
+      }}
+      onToggleLayerAspect={(id) => {
+        const target = layersRef.current.find((l) => l.id === id);
+        if (target) handleUpdateLayer(id, { aspectLocked: !target.aspectLocked });
+      }}
+      onBringLayerForward={(id) => {
+        pushHistory(cloneSnapshot());
+        setLayers((prev) => bringLayerForward(prev, id));
+      }}
+      onSendLayerBackward={(id) => {
+        pushHistory(cloneSnapshot());
+        setLayers((prev) => sendLayerBackward(prev, id));
+      }}
+      onDuplicateLayer={handleDuplicateLayer}
+      onDeleteLayer={handleDeleteLayer}
+      onClearLayerAnimation={handleClearLayerAnimation}
+      isPlaying={isPlaying}
+      isLooping={isLooping}
+      onToggleLoop={() => setIsLooping((v) => !v)}
+      onTogglePlay={handleTogglePlay}
+      onRestart={handleRestart}
+      hideTimeline={hideTimeline}
+      {...sharedTimelineProps}
+    />
+  );
+
+  const renderInspectorElement = () => (
+    <LyricsInspector
+      cues={cues}
+      currentTime={currentTime}
+      duration={duration}
+      globalOffset={globalOffset}
+      lyricSource={lyricSource}
+      validationWarnings={validationWarnings}
+      enabledTracks={enabledTracks}
+      style={style}
+      scrollingConfig={scrollingConfig}
+      beatEffects={beatEffects}
+      hasAudioBeatData={Boolean(audioAnalysis && audioAnalysis.duration > 0)}
+      detectedBeatCount={audioAnalysis?.beatTimes.length ?? 0}
+      layers={layers}
+      selectedLayerId={selectedLayerId}
+      selectedCueId={selectedCueId}
+      syncTargetIndex={syncTargetIndex}
+      activeTab={inspectorTab}
+      effectsSubTab={effectsSubTab}
+      onChangeTab={setInspectorTab}
+      onChangeEffectsSubTab={setEffectsSubTab}
+      onCollapse={() => setIsRightCollapsed(true)}
+      onToggleTrack={(track) =>
+        setEnabledTracks((prev) => ({ ...prev, [track]: !prev[track] }))
+      }
+      onChangeGlobalOffset={setGlobalOffset}
+      onImportPlainLyrics={handleImportPlainLyrics}
+      onUploadTrackSrt={handleUploadTrackSrt}
+      onClearLyrics={handleClearLyrics}
+      onExportCorrectedSrt={handleExportCorrectedSrt}
+      onUpdateCueText={(id, field, value) =>
+        setCues((prev) =>
+          prev.map((c) => (c.id === id ? { ...c, [field]: value } : c))
+        )
+      }
+      onUpdateCueTiming={(id, start, end) => {
+        pushHistory(cloneSnapshot());
+        setCues((prev) => updateCueTiming(prev, id, start, end));
+      }}
+      onStampCueAtCurrentTime={handleStampSpecificCue}
+      onDuplicateCue={handleDuplicateCue}
+      onDeleteCue={handleDeleteCue}
+      onAddCue={() => {
+        pushHistory(cloneSnapshot());
+        const newId = `cue-${Date.now()}`;
+        setCues((prev) => {
+          const lastEnd = prev.length > 0 ? prev[prev.length - 1].endTime : 0;
+          const start = Number(lastEnd.toFixed(2));
+          const end = Number(Math.min(duration, start + 3).toFixed(2));
+          return [
+            ...prev,
+            {
+              id: newId,
+              startTime: start,
+              endTime: Math.max(start + 0.5, end),
+              primary: 'خط جدید...',
+              roman: '',
+              english: '',
+            },
+          ];
+        });
+        setSelectedCueId(newId);
+      }}
+      onSeekToCue={handleSeek}
+      onChangeStyle={(patch) => setStyle((prev) => ({ ...prev, ...patch }))}
+      onChangeScrollingConfig={(patch) =>
+        setScrollingConfig((prev) => ({ ...prev, ...patch }))
+      }
+      onResetScrollingDefaults={() =>
+        setScrollingConfig(DEFAULT_FOCUSED_SCROLLING_CONFIG)
+      }
+      onChangeBeatEffects={(patch) =>
+        setBeatEffects((prev) => ({ ...prev, ...patch }))
+      }
+      onResetBeatEffects={() => setBeatEffects(DEFAULT_BEAT_EFFECTS_CONFIG)}
+      effectClips={effectClips}
+      onAddTimedEffect={handleAddTimedEffect}
+      onDeleteTimedEffect={handleDeleteTimedEffect}
+      onSelectLayer={handleSelectLayer}
+      onUpdateLayer={handleUpdateLayer}
+      onUpsertLayerKeyframe={handleUpsertLayerKeyframe}
+      onRemoveLayerKeyframe={handleRemoveLayerKeyframe}
+      onAddTextLayer={handleAddTextLayer}
+      onAddShapeLayer={handleAddShapeLayer}
+      onAddImageLayer={handleAddImageLayer}
+      onAddTimerCounterLayer={handleAddTimerCounterLayer}
+      onAutoBlendLayer={handleAutoBlendLayer}
+      onBringLayerForward={(id) => {
+        pushHistory(cloneSnapshot());
+        setLayers((prev) => bringLayerForward(prev, id));
+      }}
+      onSendLayerBackward={(id) => {
+        pushHistory(cloneSnapshot());
+        setLayers((prev) => sendLayerBackward(prev, id));
+      }}
+      onDuplicateLayer={handleDuplicateLayer}
+      onDeleteLayer={handleDeleteLayer}
+      onClearLayerAnimation={handleClearLayerAnimation}
+    />
+  );
+
   return (
     <MotionConfig reducedMotion="user">
       <div className="min-h-screen lg:h-screen flex flex-col bg-[#0B0D11] text-zinc-100 overflow-x-hidden lg:overflow-hidden">
@@ -3422,13 +3820,19 @@ export default function StudioWorkspace() {
 
         {/* Top Bar Contract: 1-row, 3-zone, icon-first navigation with hover tooltips */}
         <header className="h-12 shrink-0 px-4 sm:px-5 border-b border-white/8 bg-[#0E1117] flex items-center justify-between gap-4 select-none">
-          {/* Zone 1: Brand Wordmark */}
-          <a
-            href="#"
-            className="text-base font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0"
-          >
-            LyrCut Studio
-          </a>
+          {/* Zone 1: Brand Wordmark + Project Title */}
+          <div className="flex items-center gap-2.5 min-w-0">
+            <a
+              href="#"
+              className="text-base font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0"
+            >
+              LyrCut Studio
+            </a>
+            <span className="hidden sm:inline-block text-zinc-700">/</span>
+            <span className="hidden sm:inline-block text-xs text-zinc-400 truncate max-w-[160px]">
+              {projectName}
+            </span>
+          </div>
 
           {/* Zone 2: Icon-first Workspace Navigation with Hover Tooltips */}
           <nav
@@ -3519,8 +3923,21 @@ export default function StudioWorkspace() {
             </IconTooltip>
           </nav>
 
-          {/* Zone 3: Primary Export Action */}
-          <div className="flex items-center shrink-0">
+          {/* Zone 3: New Project + Primary Export Action */}
+          <div className="flex items-center gap-2 shrink-0">
+            <IconTooltip tip="Start a new Portrait (9:16) or Landscape (16:9) project" position="bottom" align="right">
+              <button
+                type="button"
+                data-testid="new-project-btn"
+                aria-label="New Project"
+                onClick={() => setShowProjectSetup(true)}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-[#161A22] hover:bg-[#1F2530] text-zinc-200 border border-white/10 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <FilePlus2 className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
+                <span className="hidden sm:inline">New Project</span>
+              </button>
+            </IconTooltip>
+
             <IconTooltip tip="Export 1080p Full HD video with audio & effects" position="bottom" align="right">
               <button
                 type="button"
@@ -3570,318 +3987,137 @@ export default function StudioWorkspace() {
           </div>
         </div>
 
-        {/* Dynamic 1-to-3 Column Studio Workspace (minimizing both sidebars shows Player + Timeline only) */}
-        <motion.main
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.2 }}
-          className={`flex-1 min-h-0 grid grid-cols-1 ${desktopGridClass}`}
-        >
-          {/* Left: Uploaded Items Bin (hidden in Player-Only Focus Mode or when collapsed) */}
-          {!isPlayerFocusMode && (
-            <div
-              className={`min-h-0 h-full ${
-                mobilePanel === 'media'
-                  ? isLeftCollapsed
-                    ? 'block lg:hidden'
-                    : 'block'
-                  : isLeftCollapsed
-                  ? 'hidden'
-                  : 'hidden lg:block'
-              }`}
-            >
-              <MediaBin
-                items={items}
-                activeVisualId={activeVisualId}
-                activeAudioId={activeAudioId}
-                mediaFit={mediaFit}
-                onUploadFiles={handleUploadFiles}
-                onSelectVisual={handleSelectVisual}
-                onSelectAudio={handleSelectAudio}
-                onAddVisualToTimeline={handleAddVisualToTimeline}
-                onAddVisualToUpperTrack={handleAddVisualToUpperTrack}
-                onAddAudioToTimeline={handleAddAudioToTimeline}
-                onAddAudioToNewTrack={handleAddAudioToNewTrack}
-                onAddImageAsOverlay={handleAddImageAsOverlay}
-                onRemoveItem={handleRemoveItem}
-                onChangeMediaFit={setMediaFit}
-                onCollapse={() => setIsLeftCollapsed(true)}
-              />
-            </div>
-          )}
-
-          {/* Center: Interactive Canvas Preview & Pro NLE Timeline */}
-          <div
-            className={`min-h-[540px] lg:min-h-0 h-full ${
-              isPlayerFocusMode || mobilePanel === 'preview' ? 'block' : 'hidden lg:block'
-            }`}
+        {/* Adaptive Studio Workspace:
+            - Portrait (9:16): Full-height Player docked on LEFT (top to bottom) + Lyrics/Style/Effects & Media in upper-RIGHT + Timeline spanning bottom-RIGHT
+            - Landscape (16:9): Classic 3-column layout intact (Media Bin | Player + Timeline | Lyrics/Style/Effects) */}
+        {isPortraitLayout ? (
+          <motion.main
+            key="portrait-workspace"
+            data-testid="portrait-studio-layout"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.2 }}
+            className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[380px_minmax(0,1fr)] xl:grid-cols-[430px_minmax(0,1fr)] overflow-hidden"
           >
-            <PreviewStage
-              canvasRef={canvasRef}
-              ratio={ratio}
-              onChangeRatio={handleChangeRatio}
-              showSafeZones={style.showSafeZones}
-              onToggleSafeZones={() =>
-                setStyle((s) => ({ ...s, showSafeZones: !s.showSafeZones }))
-              }
-              isLeftCollapsed={isLeftCollapsed}
-              isRightCollapsed={isRightCollapsed}
-              isPlayerFocusMode={isPlayerFocusMode}
-              onToggleLeftCollapsed={() => setIsLeftCollapsed((v) => !v)}
-              onToggleRightCollapsed={() => setIsRightCollapsed((v) => !v)}
-              onTogglePlayerFocusMode={handleTogglePlayerFocusMode}
-              layers={layers}
-              selectedLayerId={selectedLayerId}
-              scrollingEnabled={scrollingConfig.enabled}
-              onSelectLayer={handleSelectLayer}
-              onOpenAnimateForLayer={handleOpenAnimateForLayer}
-              onAutoBlendLayer={handleAutoBlendLayer}
-              onOpenBeatFx={handleOpenBeatFx}
-              onPreviewLayerPatch={handlePreviewLayerPatch}
-              onCommitLayerPatch={handleCommitLayerPatch}
-              onSetSnapGuides={setSnapGuides}
-              onToggleLayerLock={(id) => {
-                const target = layersRef.current.find((l) => l.id === id);
-                if (target) handleUpdateLayer(id, { locked: !target.locked });
-              }}
-              onToggleLayerVisible={(id) => {
-                const target = layersRef.current.find((l) => l.id === id);
-                if (target) handleUpdateLayer(id, { visible: !target.visible });
-              }}
-              onToggleLayerAspect={(id) => {
-                const target = layersRef.current.find((l) => l.id === id);
-                if (target) handleUpdateLayer(id, { aspectLocked: !target.aspectLocked });
-              }}
-              onBringLayerForward={(id) => {
-                pushHistory(cloneSnapshot());
-                setLayers((prev) => bringLayerForward(prev, id));
-              }}
-              onSendLayerBackward={(id) => {
-                pushHistory(cloneSnapshot());
-                setLayers((prev) => sendLayerBackward(prev, id));
-              }}
-              onDuplicateLayer={handleDuplicateLayer}
-              onDeleteLayer={handleDeleteLayer}
-              onClearLayerAnimation={handleClearLayerAnimation}
-              isPlaying={isPlaying}
-              isLooping={isLooping}
-              onToggleLoop={() => setIsLooping((v) => !v)}
-              onTogglePlay={handleTogglePlay}
-              onRestart={handleRestart}
-              isMuted={isMuted}
-              onToggleMute={handleToggleMute}
-              currentTime={currentTime}
-              duration={duration}
-              globalOffset={globalOffset}
-              onSeek={handleSeek}
-              cues={cues}
-              enabledTracks={enabledTracks}
-              onToggleTrack={(track) =>
-                setEnabledTracks((prev) => ({ ...prev, [track]: !prev[track] }))
-              }
-              visualVisible={visualVisible}
-              visualLocked={visualLocked}
-              onToggleVisualVisible={() => {
-                if (bgLayer) {
-                  handleUpdateLayer(bgLayer.id, { visible: !bgLayer.visible });
-                }
-              }}
-              onToggleVisualLocked={() => {
-                if (bgLayer) {
-                  handleUpdateLayer(bgLayer.id, { locked: !bgLayer.locked });
-                }
-              }}
-              visualTrackCount={visualTrackCount}
-              audioTrackCount={audioTrackCount}
-              hiddenVisualTracks={hiddenVisualTracks}
-              lockedVisualTracks={lockedVisualTracks}
-              mutedAudioTracks={mutedAudioTracks}
-              lockedAudioTracks={lockedAudioTracks}
-              onAddVisualTrack={handleAddVisualTrack}
-              onRemoveVisualTrack={handleRemoveVisualTrack}
-              onAddAudioTrack={handleAddAudioTrack}
-              onRemoveAudioTrack={handleRemoveAudioTrack}
-              onToggleVisualTrackVisible={handleToggleVisualTrackVisible}
-              onToggleVisualTrackLocked={handleToggleVisualTrackLocked}
-              onToggleAudioTrackMuted={handleToggleAudioTrackMuted}
-              onToggleAudioTrackLocked={handleToggleAudioTrackLocked}
-              onSelectAllOnVisualTrack={handleSelectAllOnVisualTrack}
-              onSelectAllOnAudioTrack={handleSelectAllOnAudioTrack}
-              visualClips={visualClips}
-              audioClips={audioClips}
-              effectClips={effectClips}
-              onPreviewVisualClip={handlePreviewVisualClip}
-              onCommitVisualClip={handleCommitVisualClip}
-              onPreviewAudioClip={handlePreviewAudioClip}
-              onCommitAudioClip={handleCommitAudioClip}
-              onPreviewEffectClip={handlePreviewEffectClip}
-              onCommitEffectClip={handleCommitEffectClip}
-              selectedItems={selectedItems}
-              onSetSelectedItems={handleSetSelectedItems}
-              onSelectAllOnTrack={handleSelectAllOnTrack}
-              hasClipboard={Boolean(clipboard && clipboard.items.length > 0)}
-              onCopySelected={handleCopySelected}
-              onCutSelected={handleCutSelected}
-              onPasteAtPlayhead={handlePasteAtPlayhead}
-              onDeleteSelected={handleDeleteSelected}
-              onSplitAtPlayhead={handleSplitAtPlayhead}
-              onClearAllLyrics={handleClearLyrics}
-              beatTimes={audioAnalysis?.beatTimes ?? []}
-              selectedCueId={selectedCueId}
-              onSelectCue={(id, idx) => {
-                setSelectedCueId(id);
-                if (typeof idx === 'number') setSyncTargetIndex(idx);
-              }}
-              syncTargetIndex={syncTargetIndex}
-              onSelectSyncTarget={setSyncTargetIndex}
-              onStampNextLine={handleStampNextLine}
-              onChangeGlobalOffset={setGlobalOffset}
-              onPreviewCueTiming={handlePreviewCueTiming}
-              onCommitCueTiming={handleCommitCueTiming}
-              waveformPeaks={waveformPeaks}
-              activeAudioName={activeAudioItem?.name ?? null}
-              markers={markers}
-              onAddMarker={(time) => {
-                pushHistory(cloneSnapshot());
-                setMarkers((prev) => [
-                  ...prev,
-                  {
-                    id: `marker-${Date.now()}`,
-                    time: Number(time.toFixed(2)),
-                    label: `M${prev.length + 1}`,
-                  },
-                ]);
-              }}
-              onRemoveMarker={(id) => {
-                pushHistory(cloneSnapshot());
-                setMarkers((prev) => prev.filter((m) => m.id !== id));
-              }}
-              canUndo={historyPast.length > 0}
-              canRedo={historyFuture.length > 0}
-              onUndo={handleUndo}
-              onRedo={handleRedo}
-              autoRipple={autoRipple}
-              onToggleAutoRipple={() => setAutoRipple((v) => !v)}
-            />
-          </div>
-
-          {/* Right: Multi-Language Lyrics, Overlay Style & Effects Inspector */}
-          {!isPlayerFocusMode && (
+            {/* LEFT FULL-HEIGHT PORTRAIT PLAYER (Top to Bottom) */}
             <div
-              className={`min-h-0 h-full ${
-                mobilePanel === 'lyrics' ||
-                mobilePanel === 'style' ||
-                mobilePanel === 'effects'
-                  ? isRightCollapsed
-                    ? 'block lg:hidden'
-                    : 'block'
-                  : isRightCollapsed
-                  ? 'hidden'
-                  : 'hidden lg:block'
+              data-testid="portrait-player-column"
+              className={`min-h-[540px] lg:min-h-0 h-full border-r border-white/8 ${
+                mobilePanel === 'preview' ? 'block' : 'hidden lg:block'
               }`}
             >
-              <LyricsInspector
-                cues={cues}
-                currentTime={currentTime}
-                duration={duration}
-                globalOffset={globalOffset}
-                lyricSource={lyricSource}
-                validationWarnings={validationWarnings}
-                enabledTracks={enabledTracks}
-                style={style}
-                scrollingConfig={scrollingConfig}
-                beatEffects={beatEffects}
-                hasAudioBeatData={Boolean(audioAnalysis && audioAnalysis.duration > 0)}
-                detectedBeatCount={audioAnalysis?.beatTimes.length ?? 0}
-                layers={layers}
-                selectedLayerId={selectedLayerId}
-                selectedCueId={selectedCueId}
-                syncTargetIndex={syncTargetIndex}
-                activeTab={inspectorTab}
-                effectsSubTab={effectsSubTab}
-                onChangeTab={setInspectorTab}
-                onChangeEffectsSubTab={setEffectsSubTab}
-                onCollapse={() => setIsRightCollapsed(true)}
-                onToggleTrack={(track) =>
-                  setEnabledTracks((prev) => ({ ...prev, [track]: !prev[track] }))
-                }
-                onChangeGlobalOffset={setGlobalOffset}
-                onImportPlainLyrics={handleImportPlainLyrics}
-                onUploadTrackSrt={handleUploadTrackSrt}
-                onClearLyrics={handleClearLyrics}
-                onExportCorrectedSrt={handleExportCorrectedSrt}
-                onUpdateCueText={(id, field, value) =>
-                  setCues((prev) =>
-                    prev.map((c) => (c.id === id ? { ...c, [field]: value } : c))
-                  )
-                }
-                onUpdateCueTiming={(id, start, end) => {
-                  pushHistory(cloneSnapshot());
-                  setCues((prev) => updateCueTiming(prev, id, start, end));
-                }}
-                onStampCueAtCurrentTime={handleStampSpecificCue}
-                onDuplicateCue={handleDuplicateCue}
-                onDeleteCue={handleDeleteCue}
-                onAddCue={() => {
-                  pushHistory(cloneSnapshot());
-                  const newId = `cue-${Date.now()}`;
-                  setCues((prev) => {
-                    const lastEnd = prev.length > 0 ? prev[prev.length - 1].endTime : 0;
-                    const start = Number(lastEnd.toFixed(2));
-                    const end = Number(Math.min(duration, start + 3).toFixed(2));
-                    return [
-                      ...prev,
-                      {
-                        id: newId,
-                        startTime: start,
-                        endTime: Math.max(start + 0.5, end),
-                        primary: 'خط جدید...',
-                        roman: '',
-                        english: '',
-                      },
-                    ];
-                  });
-                  setSelectedCueId(newId);
-                }}
-                onSeekToCue={handleSeek}
-                onChangeStyle={(patch) => setStyle((prev) => ({ ...prev, ...patch }))}
-                onChangeScrollingConfig={(patch) =>
-                  setScrollingConfig((prev) => ({ ...prev, ...patch }))
-                }
-                onResetScrollingDefaults={() =>
-                  setScrollingConfig(DEFAULT_FOCUSED_SCROLLING_CONFIG)
-                }
-                onChangeBeatEffects={(patch) =>
-                  setBeatEffects((prev) => ({ ...prev, ...patch }))
-                }
-                onResetBeatEffects={() => setBeatEffects(DEFAULT_BEAT_EFFECTS_CONFIG)}
-                effectClips={effectClips}
-                onAddTimedEffect={handleAddTimedEffect}
-                onDeleteTimedEffect={handleDeleteTimedEffect}
-                onSelectLayer={handleSelectLayer}
-                onUpdateLayer={handleUpdateLayer}
-                onUpsertLayerKeyframe={handleUpsertLayerKeyframe}
-                onRemoveLayerKeyframe={handleRemoveLayerKeyframe}
-                onAddTextLayer={handleAddTextLayer}
-                onAddShapeLayer={handleAddShapeLayer}
-                onAddImageLayer={handleAddImageLayer}
-                onAddTimerCounterLayer={handleAddTimerCounterLayer}
-                onAutoBlendLayer={handleAutoBlendLayer}
-                onBringLayerForward={(id) => {
-                  pushHistory(cloneSnapshot());
-                  setLayers((prev) => bringLayerForward(prev, id));
-                }}
-                onSendLayerBackward={(id) => {
-                  pushHistory(cloneSnapshot());
-                  setLayers((prev) => sendLayerBackward(prev, id));
-                }}
-                onDuplicateLayer={handleDuplicateLayer}
-                onDeleteLayer={handleDeleteLayer}
-                onClearLayerAnimation={handleClearLayerAnimation}
-              />
+              {renderPreviewStageElement(true)}
             </div>
-          )}
-        </motion.main>
+
+            {/* RIGHT WORKSPACE: Top (Media Bin + Lyrics/Style/Effects Inspector) + Bottom (Timeline) */}
+            <div className="flex-1 min-w-0 min-h-0 h-full flex flex-col overflow-hidden">
+              <div className="flex-1 min-h-0 flex overflow-hidden">
+                {!isLeftCollapsed && (
+                  <div
+                    className={`w-full lg:w-[236px] shrink-0 min-h-0 h-full border-r border-white/8 ${
+                      mobilePanel === 'media' ? 'block' : 'hidden lg:block'
+                    }`}
+                  >
+                    {renderMediaBinElement()}
+                  </div>
+                )}
+
+                {!isRightCollapsed && (
+                  <div
+                    data-testid="portrait-inspector-slot"
+                    className={`flex-1 min-w-0 min-h-0 h-full ${
+                      mobilePanel === 'lyrics' ||
+                      mobilePanel === 'style' ||
+                      mobilePanel === 'effects'
+                        ? 'block'
+                        : 'hidden lg:block'
+                    }`}
+                  >
+                    {renderInspectorElement()}
+                  </div>
+                )}
+
+                {isLeftCollapsed && isRightCollapsed && (
+                  <div className="flex-1 flex items-center justify-center bg-[#0B0D11] text-xs text-zinc-500">
+                    Panels minimized — expand Media or Lyrics/Effects from the top bar.
+                  </div>
+                )}
+              </div>
+
+              {/* Bottom-Right Full-Width Timeline */}
+              <div
+                data-testid="portrait-timeline-slot"
+                className="shrink-0 border-t border-white/8"
+              >
+                <TimelineEditor {...sharedTimelineProps} />
+              </div>
+            </div>
+          </motion.main>
+        ) : (
+          <motion.main
+            key="landscape-workspace"
+            data-testid="landscape-studio-layout"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.2 }}
+            className={`flex-1 min-h-0 grid grid-cols-1 ${desktopGridClass}`}
+          >
+            {/* Left: Uploaded Items Bin (hidden in Player-Only Focus Mode or when collapsed) */}
+            {!isPlayerFocusMode && (
+              <div
+                className={`min-h-0 h-full ${
+                  mobilePanel === 'media'
+                    ? isLeftCollapsed
+                      ? 'block lg:hidden'
+                      : 'block'
+                    : isLeftCollapsed
+                    ? 'hidden'
+                    : 'hidden lg:block'
+                }`}
+              >
+                {renderMediaBinElement()}
+              </div>
+            )}
+
+            {/* Center: Interactive Canvas Preview & Pro NLE Timeline */}
+            <div
+              className={`min-h-[540px] lg:min-h-0 h-full ${
+                isPlayerFocusMode || mobilePanel === 'preview' ? 'block' : 'hidden lg:block'
+              }`}
+            >
+              {renderPreviewStageElement(false)}
+            </div>
+
+            {/* Right: Multi-Language Lyrics, Overlay Style & Effects Inspector */}
+            {!isPlayerFocusMode && (
+              <div
+                className={`min-h-0 h-full ${
+                  mobilePanel === 'lyrics' ||
+                  mobilePanel === 'style' ||
+                  mobilePanel === 'effects'
+                    ? isRightCollapsed
+                      ? 'block lg:hidden'
+                      : 'block'
+                    : isRightCollapsed
+                    ? 'hidden'
+                    : 'hidden lg:block'
+                }`}
+              >
+                {renderInspectorElement()}
+              </div>
+            )}
+          </motion.main>
+        )}
+
+        {/* New Project Aspect Ratio & Workspace Setup Modal */}
+        <ProjectSetupModal
+          isOpen={showProjectSetup}
+          canDismiss={hasCreatedProject}
+          initialName={projectName}
+          initialRatio={ratio}
+          onCreateProject={handleCreateProjectFromSetup}
+          onClose={() => setShowProjectSetup(false)}
+        />
 
         {/* Full HD Export Modal */}
         <ExportModal

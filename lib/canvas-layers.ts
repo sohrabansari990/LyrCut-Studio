@@ -106,6 +106,10 @@ export interface CanvasLayer {
   timerScope?: 'song' | 'layer';
   timerShowProgress?: boolean;
   timerAccentColor?: string;
+  timerBgColor?: string;
+  timerBgOpacity?: number; // 0 = transparent (default), 0..1
+  timerBorderOpacity?: number; // 0 = no border (default), 0..1
+  timerShowDot?: boolean;
 }
 
 export interface SyncableVisualClip {

@@ -46,6 +46,14 @@ import {
   Eraser,
   Timer,
   Wand2,
+  Flame,
+  Heart,
+  Grid,
+  Users,
+  Wind,
+  Disc3,
+  Orbit,
+  User,
 } from 'lucide-react';
 import {
   EnabledTracks,
@@ -254,6 +262,7 @@ export default function LyricsInspector({
   const [timedFxEnd, setTimedFxEnd] = useState<number>(8);
   const [timedFxType, setTimedFxType] =
     useState<Exclude<BeatVisualEffectType, 'none'>>('ring-ripple');
+  const [fxCategoryFilter, setFxCategoryFilter] = useState<'all' | 'motion' | 'body'>('all');
 
   const farsiSrtRef = useRef<HTMLInputElement>(null);
   const romanSrtRef = useRef<HTMLInputElement>(null);
@@ -1829,7 +1838,135 @@ export default function LyricsInspector({
                       </span>
                     </div>
 
-                    <div className="flex items-center justify-between gap-3">
+                    {/* Transparent & Customizable Timer Background Controls */}
+                    <div className="space-y-2 pt-1.5 border-t border-white/8">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <span className="text-[10px] font-medium text-zinc-300">
+                          Background Style
+                        </span>
+                        <div className="flex items-center gap-1">
+                          {(
+                            [
+                              { id: 'transparent', label: 'Transparent', bgOp: 0, bdOp: 0 },
+                              { id: 'glass', label: 'Glass', bgOp: 0.45, bdOp: 0.25 },
+                              { id: 'solid', label: 'Solid', bgOp: 0.85, bdOp: 0.35 },
+                            ] as const
+                          ).map((preset) => {
+                            const curOp = selectedLayer.timerBgOpacity ?? 0;
+                            const isActive =
+                              preset.id === 'transparent'
+                                ? curOp <= 0.02
+                                : preset.id === 'glass'
+                                ? curOp > 0.02 && curOp < 0.7
+                                : curOp >= 0.7;
+                            return (
+                              <button
+                                key={preset.id}
+                                type="button"
+                                data-testid={`timer-bg-preset-${preset.id}`}
+                                onClick={() =>
+                                  onUpdateLayer(selectedLayer.id, {
+                                    timerBgOpacity: preset.bgOp,
+                                    timerBorderOpacity: preset.bdOp,
+                                  })
+                                }
+                                className={`px-1.5 py-0.5 rounded text-[10px] border cursor-pointer ${
+                                  isActive
+                                    ? 'bg-sky-500/20 border-sky-400/50 text-sky-200 font-medium'
+                                    : 'bg-[#161A22] border-white/10 text-zinc-400 hover:text-zinc-200'
+                                }`}
+                              >
+                                {preset.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-zinc-400">BG Opacity</span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={5}
+                          aria-label="Timer background opacity"
+                          data-testid="timer-bg-opacity-slider"
+                          value={Math.round((selectedLayer.timerBgOpacity ?? 0) * 100)}
+                          onChange={(e) =>
+                            onUpdateLayer(selectedLayer.id, {
+                              timerBgOpacity: Number(e.target.value) / 100,
+                            })
+                          }
+                          className="flex-1 accent-sky-400 cursor-pointer"
+                        />
+                        <span className="font-mono text-zinc-300 w-9 text-right">
+                          {Math.round((selectedLayer.timerBgOpacity ?? 0) * 100)}%
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-zinc-400">Border</span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={5}
+                          aria-label="Timer border opacity"
+                          value={Math.round((selectedLayer.timerBorderOpacity ?? 0) * 100)}
+                          onChange={(e) =>
+                            onUpdateLayer(selectedLayer.id, {
+                              timerBorderOpacity: Number(e.target.value) / 100,
+                            })
+                          }
+                          className="flex-1 accent-sky-400 cursor-pointer"
+                        />
+                        <span className="font-mono text-zinc-300 w-9 text-right">
+                          {Math.round((selectedLayer.timerBorderOpacity ?? 0) * 100)}%
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="flex items-center gap-1.5 text-zinc-400 flex-1">
+                          <span>Font</span>
+                          <select
+                            aria-label="Timer font family"
+                            value={selectedLayer.fontFamily ?? ''}
+                            onChange={(e) =>
+                              onUpdateLayer(selectedLayer.id, {
+                                fontFamily: e.target.value || undefined,
+                              })
+                            }
+                            className="flex-1 bg-[#161A22] text-zinc-100 text-[10px] rounded px-1.5 py-1 border border-white/10"
+                          >
+                            <option value="">JetBrains Mono (Default)</option>
+                            {LATIN_FONT_OPTIONS.map((f) => (
+                              <option key={f.value} value={f.value}>
+                                {f.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <button
+                          type="button"
+                          aria-pressed={Boolean(selectedLayer.timerShowDot)}
+                          onClick={() =>
+                            onUpdateLayer(selectedLayer.id, {
+                              timerShowDot: !(selectedLayer.timerShowDot ?? false),
+                            })
+                          }
+                          className={`px-2 py-1 rounded border text-[10px] font-medium cursor-pointer whitespace-nowrap ${
+                            selectedLayer.timerShowDot
+                              ? 'bg-rose-500/20 border-rose-400/50 text-rose-200'
+                              : 'bg-[#161A22] border-white/10 text-zinc-400 hover:text-white'
+                          }`}
+                        >
+                          Live Dot
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 pt-1">
                       <label className="flex items-center gap-1.5 text-zinc-400">
                         <span>Text</span>
                         <input
@@ -1838,6 +1975,24 @@ export default function LyricsInspector({
                           value={selectedLayer.color ?? '#FFFFFF'}
                           onChange={(e) =>
                             onUpdateLayer(selectedLayer.id, { color: e.target.value })
+                          }
+                          className="w-6 h-5 rounded bg-transparent border border-white/10 cursor-pointer"
+                        />
+                      </label>
+                      <label className="flex items-center gap-1.5 text-zinc-400">
+                        <span>BG</span>
+                        <input
+                          type="color"
+                          aria-label="Timer background color"
+                          value={selectedLayer.timerBgColor ?? '#090B0F'}
+                          onChange={(e) =>
+                            onUpdateLayer(selectedLayer.id, {
+                              timerBgColor: e.target.value,
+                              timerBgOpacity:
+                                (selectedLayer.timerBgOpacity ?? 0) <= 0.02
+                                  ? 0.55
+                                  : selectedLayer.timerBgOpacity,
+                            })
                           }
                           className="w-6 h-5 rounded bg-transparent border border-white/10 cursor-pointer"
                         />
@@ -2357,9 +2512,38 @@ export default function LyricsInspector({
                 </IconTooltip>
               </div>
 
-              {/* Visual Effect Preset Grid (Filmora-style visual cards) */}
-              <div className="grid grid-cols-2 gap-2" data-testid="beat-effect-presets">
-                {BEAT_VISUAL_EFFECT_PRESETS.map((preset, idx) => {
+              {/* Category Filter for Motion vs Body & Aura FX */}
+              <div className="grid grid-cols-3 gap-1 p-0.5 bg-[#090B0F] rounded-lg border border-white/8">
+                {(
+                  [
+                    { id: 'all', label: `All (${BEAT_VISUAL_EFFECT_PRESETS.length})` },
+                    { id: 'motion', label: 'Beat Motion' },
+                    { id: 'body', label: 'Body & Aura' },
+                  ] as const
+                ).map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setFxCategoryFilter(tab.id)}
+                    className={`py-1 px-2 text-[10px] font-medium rounded-md transition-colors cursor-pointer ${
+                      fxCategoryFilter === tab.id
+                        ? 'bg-[#1D222D] text-amber-300'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Visual Effect Preset Grid (Beat Motion + Body & Aura Effects) */}
+              <div
+                className="grid grid-cols-[repeat(auto-fill,minmax(135px,1fr))] gap-2 max-h-[250px] overflow-y-auto pr-0.5"
+                data-testid="beat-effect-presets"
+              >
+                {BEAT_VISUAL_EFFECT_PRESETS.filter(
+                  (preset) => fxCategoryFilter === 'all' || preset.category === fxCategoryFilter
+                ).map((preset, idx) => {
                   const selected = beatEffects.effectType === preset.id;
                   const meta = BEAT_EFFECT_VISUALS[preset.id];
                   const IconComp = meta.icon;
@@ -2382,10 +2566,10 @@ export default function LyricsInspector({
                         }`}
                       >
                         <div
-                          className={`h-12 w-full relative flex items-center justify-center overflow-hidden ${meta.previewBg}`}
+                          className={`h-11 w-full relative flex items-center justify-center overflow-hidden ${meta.previewBg}`}
                         >
                           <div
-                            className={`w-8 h-8 rounded-full flex items-center justify-center transition-transform group-hover:scale-110 ${
+                            className={`w-7 h-7 rounded-full flex items-center justify-center transition-transform group-hover:scale-110 ${
                               selected
                                 ? 'bg-amber-500/25 text-amber-300'
                                 : 'bg-black/35 text-zinc-200'
@@ -2393,13 +2577,18 @@ export default function LyricsInspector({
                           >
                             <IconComp className="w-4 h-4" aria-hidden="true" />
                           </div>
+                          {preset.category === 'body' && (
+                            <span className="absolute top-1 left-1.5 px-1 py-0.2 rounded bg-black/50 text-[8px] font-semibold uppercase tracking-wide text-fuchsia-300">
+                              Body
+                            </span>
+                          )}
                           {selected && (
                             <span className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-amber-500 text-zinc-950 flex items-center justify-center">
                               <Check className="w-2.5 h-2.5" aria-hidden="true" />
                             </span>
                           )}
                         </div>
-                        <div className="px-2 py-1.5 flex items-center justify-between gap-1">
+                        <div className="px-2 py-1 flex items-center justify-between gap-1">
                           <span className="text-[11px] font-medium text-zinc-100 truncate">
                             {preset.label}
                           </span>
@@ -2412,14 +2601,15 @@ export default function LyricsInspector({
 
               {/* Beat Sync Target & Strength */}
               <div className="p-2.5 rounded-lg bg-[#0E1117] border border-white/8 space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[11px] font-medium text-zinc-300">Sync To</span>
-                  <div className="grid grid-cols-3 gap-1 p-0.5 bg-[#090B0F] rounded-md border border-white/8">
+                <div className="flex items-center justify-between gap-1.5">
+                  <span className="text-[11px] font-medium text-zinc-300 shrink-0">Sync To</span>
+                  <div className="grid grid-cols-4 gap-0.5 p-0.5 bg-[#090B0F] rounded-md border border-white/8 flex-1">
                     {(
                       [
-                        { id: 'background', label: 'BG', tip: 'Animate background media only', icon: Film },
-                        { id: 'lyrics', label: 'Lyrics', tip: 'Bounce lyrics only', icon: Subtitles },
-                        { id: 'both', label: 'Both', tip: 'Sync both background & lyrics', icon: Sparkles },
+                        { id: 'background', label: 'BG', tip: 'Animate background media', icon: Film },
+                        { id: 'character', label: 'Char', tip: 'Animate V2+ character & images', icon: User },
+                        { id: 'lyrics', label: 'Lyrics', tip: 'Bounce lyrics', icon: Subtitles },
+                        { id: 'both', label: 'All', tip: 'Sync BG, character & lyrics', icon: Sparkles },
                       ] as const
                     ).map((opt) => {
                       const active = beatEffects.syncTarget === opt.id;
@@ -2433,13 +2623,13 @@ export default function LyricsInspector({
                             }
                             aria-label={`Sync beats to ${opt.id}`}
                             aria-pressed={active}
-                            className={`inline-flex items-center justify-center gap-1 px-2 py-1 text-[10px] font-medium rounded cursor-pointer ${
+                            className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-1 text-[10px] font-medium rounded cursor-pointer ${
                               active
                                 ? 'bg-[#1D222D] text-amber-300'
                                 : 'text-zinc-400 hover:text-zinc-200'
                             }`}
                           >
-                            <IconComp className="w-3 h-3" aria-hidden="true" />
+                            <IconComp className="w-3 h-3 shrink-0" aria-hidden="true" />
                             <span>{opt.label}</span>
                           </button>
                         </IconTooltip>
@@ -2597,7 +2787,7 @@ export default function LyricsInspector({
                   <span className="text-[10px] text-zinc-400">Live & 1080p</span>
                 </div>
 
-                <div className="grid grid-cols-2 gap-1.5">
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-1.5">
                   {(
                     [
                       {
@@ -2645,41 +2835,105 @@ export default function LyricsInspector({
                 </div>
               </div>
 
-              {/* Audio Visualizer Section */}
+              {/* Audio Visualizer Section (12 Beat-Synced Presets + Off) */}
               <div className="p-2.5 rounded-lg bg-[#0E1117] border border-white/8 space-y-2.5">
                 <div className="flex items-center justify-between">
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-zinc-100">
                     <BarChart3 className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
-                    <span>Audio Visualizer</span>
+                    <span>Audio Visualizers</span>
+                  </span>
+                  <span className="text-[10px] text-zinc-500">
+                    24-band live sync
                   </span>
                 </div>
 
-                <div className="grid grid-cols-5 gap-1" data-testid="visualizer-presets">
+                <div
+                  className="grid grid-cols-[repeat(auto-fill,minmax(135px,1fr))] gap-1.5 max-h-[260px] overflow-y-auto pr-0.5"
+                  data-testid="visualizer-presets"
+                >
                   {AUDIO_VISUALIZER_PRESETS.map((viz, idx) => {
                     const active = beatEffects.visualizerType === viz.id;
                     const IconComp = VISUALIZER_ICONS[viz.id];
+                    const [c1, c2] = viz.palette;
                     return (
                       <IconTooltip
                         key={viz.id}
                         tip={viz.description}
                         position="top"
-                        align={idx <= 1 ? 'left' : idx >= 3 ? 'right' : 'center'}
+                        align={idx % 2 === 0 ? 'left' : 'right'}
                       >
                         <button
                           type="button"
                           onClick={() => onChangeBeatEffects({ visualizerType: viz.id })}
                           aria-label={`Audio visualizer: ${viz.label}`}
                           aria-pressed={active}
-                          className={`w-full flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-md border transition-colors cursor-pointer ${
+                          className={`w-full rounded-lg border overflow-hidden text-left transition-all cursor-pointer ${
                             active
-                              ? 'bg-amber-500/20 border-amber-500/60 text-amber-300'
-                              : 'bg-[#090B0F] border-white/8 text-zinc-400 hover:text-zinc-200 hover:border-white/20'
+                              ? 'border-amber-500 ring-1 ring-amber-500/40 bg-[#1B202C]'
+                              : 'border-white/10 bg-[#090B0F] hover:border-white/25'
                           }`}
                         >
-                          <IconComp className="w-3.5 h-3.5" aria-hidden="true" />
-                          <span className="text-[9px] font-medium truncate max-w-full">
-                            {viz.label}
-                          </span>
+                          <div
+                            className="h-9 w-full relative flex items-center justify-center px-2"
+                            style={{
+                              background:
+                                viz.id === 'none'
+                                  ? '#111319'
+                                  : `linear-gradient(135deg, ${c1}24 0%, #090B0F 55%, ${c2}2B 100%)`,
+                            }}
+                          >
+                            {viz.id === 'none' ? (
+                              <Ban className="w-3.5 h-3.5 text-zinc-500" aria-hidden="true" />
+                            ) : viz.styleTag === 'bars' ? (
+                              <div className="flex items-end gap-[2px] h-5">
+                                {[0.35, 0.75, 0.5, 1, 0.65, 0.85, 0.4, 0.9, 0.55].map(
+                                  (barH, bIdx) => (
+                                    <span
+                                      key={bIdx}
+                                      className="w-[3px] rounded-full"
+                                      style={{
+                                        height: `${Math.round(barH * 18)}px`,
+                                        background: `linear-gradient(180deg, ${c1}, ${c2})`,
+                                      }}
+                                    />
+                                  )
+                                )}
+                              </div>
+                            ) : viz.styleTag === 'circle' ? (
+                              <div
+                                className="w-6 h-6 rounded-full flex items-center justify-center"
+                                style={{
+                                  border: `2px solid ${c1}`,
+                                  boxShadow: `0 0 10px ${c2}88`,
+                                }}
+                              >
+                                <IconComp className="w-3 h-3 text-zinc-100" aria-hidden="true" />
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-1.5">
+                                <IconComp
+                                  className="w-4 h-4"
+                                  aria-hidden="true"
+                                />
+                                <span
+                                  className="h-1 w-10 rounded-full"
+                                  style={{
+                                    background: `linear-gradient(90deg, ${c1}, ${c2})`,
+                                  }}
+                                />
+                              </div>
+                            )}
+                            {active && (
+                              <span className="absolute top-1 right-1 w-3.5 h-3.5 rounded-full bg-amber-500 text-zinc-950 flex items-center justify-center">
+                                <Check className="w-2 h-2" aria-hidden="true" />
+                              </span>
+                            )}
+                          </div>
+                          <div className="px-2 py-1 flex items-center justify-between gap-1">
+                            <span className="text-[10px] font-medium text-zinc-100 truncate">
+                              {viz.label}
+                            </span>
+                          </div>
                         </button>
                       </IconTooltip>
                     );
@@ -3205,6 +3459,34 @@ const BEAT_EFFECT_VISUALS: Record<
     icon: Sparkles,
     previewBg: 'bg-gradient-to-br from-fuchsia-950/80 via-[#1b1224] to-cyan-900/60',
   },
+  'neon-rush': {
+    icon: Flame,
+    previewBg: 'bg-gradient-to-br from-fuchsia-950/90 via-indigo-950/80 to-cyan-900/60',
+  },
+  'lightning-vortex': {
+    icon: Zap,
+    previewBg: 'bg-gradient-to-br from-blue-950/90 via-[#0d192e] to-sky-800/60',
+  },
+  'abstract-glitter': {
+    icon: Sparkles,
+    previewBg: 'bg-gradient-to-br from-amber-900/60 via-[#1d1826] to-pink-900/50',
+  },
+  'ghost-clone': {
+    icon: Users,
+    previewBg: 'bg-gradient-to-br from-violet-950/90 via-[#181226] to-fuchsia-900/60',
+  },
+  'neon-outline': {
+    icon: Orbit,
+    previewBg: 'bg-gradient-to-br from-teal-950/90 via-[#0d2024] to-cyan-900/60',
+  },
+  'heart-particles': {
+    icon: Heart,
+    previewBg: 'bg-gradient-to-br from-rose-950/90 via-[#26101c] to-pink-900/60',
+  },
+  'speed-lines': {
+    icon: Wind,
+    previewBg: 'bg-gradient-to-br from-slate-800/80 via-[#141923] to-sky-900/50',
+  },
 };
 
 const VISUALIZER_ICONS: Record<
@@ -3213,8 +3495,17 @@ const VISUALIZER_ICONS: Record<
 > = {
   none: Ban,
   'spectrum-bars': BarChart3,
+  'iridescent-bars': BarChart3,
+  'dot-matrix': Grid,
   'mirror-wave': AudioWaveform,
+  'waving-line': Waves,
   'circular-halo': Radio,
+  'iridescent-circle': Disc3,
+  'bass-blob': Orbit,
+  'audio-spectrum': Activity,
+  'color-ribbon': Sparkles,
+  'border-spectrum': Layers,
+  'pulse-particles': CircleDot,
   'pulse-line': Activity,
 };
 

@@ -189,6 +189,7 @@ interface PreviewStageProps {
   onRedo: () => void;
   autoRipple: boolean;
   onToggleAutoRipple: () => void;
+  hideTimeline?: boolean;
 }
 
 type CanvasInteraction = {
@@ -303,6 +304,7 @@ export default function PreviewStage({
   onRedo,
   autoRipple,
   onToggleAutoRipple,
+  hideTimeline = false,
 }: PreviewStageProps) {
   const [interaction, setInteraction] = useState<CanvasInteraction | null>(null);
   const [canvasSnapEnabled, setCanvasSnapEnabled] = useState<boolean>(true);
@@ -339,7 +341,7 @@ export default function PreviewStage({
     const ro = new ResizeObserver(computeSize);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [ratio, isLeftCollapsed, isRightCollapsed, isPlayerFocusMode]);
+  }, [ratio, isLeftCollapsed, isRightCollapsed, isPlayerFocusMode, hideTimeline]);
 
   const nativeDim = getCanvasDimensions(ratio);
   const selectedLayer = layers.find((l) => l.id === selectedLayerId) ?? null;
@@ -635,9 +637,9 @@ export default function PreviewStage({
       className="flex flex-col h-full bg-[#0B0D11] overflow-hidden"
     >
       {/* Compact Icon-First Stage Top Bar (Panel Restore + Ratio + Animate + Layer Quick HUD + Focus Player) */}
-      <div className="px-2.5 py-1.5 border-b border-white/8 bg-[#0E1117] flex items-center justify-between gap-2 select-none">
+      <div className="px-2.5 py-1.5 border-b border-white/8 bg-[#0E1117] flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5 select-none">
         {/* Left: Restore Left Panel + Aspect Ratio Switcher */}
-        <div className="flex items-center gap-1.5 min-w-0">
+        <div className="flex items-center gap-1.5 min-w-0 shrink-0">
           {!isPlayerFocusMode && isLeftCollapsed && (
             <IconTooltip tip="Expand Uploaded Media Panel" position="bottom" align="left">
               <button
@@ -695,9 +697,13 @@ export default function PreviewStage({
         {!isPlayerFocusMode && selectedLayer && (
           <div
             data-testid="canvas-layer-hud"
-            className="hidden sm:flex items-center gap-1 text-[11px] min-w-0"
+            className={`hidden sm:flex items-center gap-1 text-[11px] min-w-0 flex-wrap ${
+              hideTimeline
+                ? 'order-3 w-full pt-1 border-t border-white/6 justify-between'
+                : ''
+            }`}
           >
-            <span className="font-medium text-amber-300 truncate max-w-[140px] mr-0.5">
+            <span className="font-medium text-amber-300 truncate max-w-[125px] mr-0.5">
               {formatLayerDisplayLabel(selectedLayer)}
             </span>
             <IconTooltip tip="Animate layer & add keyframes" position="bottom">
@@ -1110,8 +1116,8 @@ export default function PreviewStage({
         </div>
       </div>
 
-      {/* Professional Video-Editing Timeline (HIDDEN in Player-Only Focus Mode!) */}
-      {!isPlayerFocusMode && (
+      {/* Professional Video-Editing Timeline (HIDDEN in Player-Only Focus Mode or Portrait Left-Dock Mode) */}
+      {!isPlayerFocusMode && !hideTimeline && (
         <TimelineEditor
           currentTime={currentTime}
           duration={duration}

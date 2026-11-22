@@ -46,7 +46,7 @@ export async function extractWaveformPeaks(
       channel,
       audioBuffer.sampleRate,
       30,
-      16
+      24
     );
 
     return {
