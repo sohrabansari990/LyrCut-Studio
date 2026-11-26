@@ -112,6 +112,7 @@ export interface ExportVideoParams {
   farsiFontFamily: string;
   nastaliqFontFamily: string;
   latinFontFamily: string;
+  coverThumbnailUrl?: string | null;
   signal?: AbortSignal;
   onProgress?: (info: ExportProgressInfo) => void;
 }
@@ -450,6 +451,21 @@ export async function exportFullHdVideo(params: ExportVideoParams): Promise<Expo
       await loadVisualAsset(params.visualItem.kind, params.visualItem.url);
     }
 
+    let coverThumbnailImg: HTMLImageElement | null = null;
+    if (params.coverThumbnailUrl) {
+      try {
+        coverThumbnailImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const el = new Image();
+          el.crossOrigin = 'anonymous';
+          el.onload = () => resolve(el);
+          el.onerror = () => reject(new Error('Failed to load cover thumbnail.'));
+          el.src = params.coverThumbnailUrl!;
+        });
+      } catch {
+        coverThumbnailImg = null;
+      }
+    }
+
     const decodedAudioMap = new Map<string, AudioBuffer>();
     if (activeAudioClips.length > 0) {
       for (const aClip of activeAudioClips) {
@@ -772,37 +788,59 @@ export async function exportFullHdVideo(params: ExportVideoParams): Promise<Expo
         }
       }
 
-      renderFrameToCanvas({
-        ctx,
-        width,
-        height,
-        ratio: params.ratio,
-        mediaSource: frameMediaSource,
-        mediaLayers: frameMediaLayers,
-        clipMediaSources: frameClipSources,
-        clipEnvelopeOpacities: frameClipEnvelopes,
-        hiddenVisualTracks: hiddenVisualSet,
-        mediaOpacity: frameMediaOpacity,
-        mediaFit: params.mediaFit,
-        cues: params.cues,
-        currentTime: t,
-        globalOffset: params.globalOffset,
-        enabledTracks: params.enabledTracks,
-        style: params.style,
-        scrollingConfig: params.scrollingConfig,
-        beatEffects: params.beatEffects ?? DEFAULT_BEAT_EFFECTS_CONFIG,
-        effectClips: activeEffectClips,
-        projectDuration: exportDuration,
-        audioAnalysis: frameAudioAnalysis,
-        audioAnalysisTime: frameAudioAnalysisTime,
-        layers: params.layers,
-        layerImages: params.layerImages,
-        farsiFontFamily: params.farsiFontFamily,
-        nastaliqFontFamily: params.nastaliqFontFamily,
-        latinFontFamily: params.latinFontFamily,
-        drawSafeZones: false,
-        drawLayerHandles: false,
-      });
+      if (f === 0 && coverThumbnailImg) {
+        ctx.fillStyle = '#090B0F';
+        ctx.fillRect(0, 0, width, height);
+        const imgAspect =
+          coverThumbnailImg.naturalWidth / Math.max(1, coverThumbnailImg.naturalHeight);
+        const targetAspect = width / height;
+        let dw = width;
+        let dh = height;
+        let dx = 0;
+        let dy = 0;
+        if (imgAspect > targetAspect) {
+          dh = height;
+          dw = dh * imgAspect;
+          dx = (width - dw) / 2;
+        } else {
+          dw = width;
+          dh = dw / imgAspect;
+          dy = (height - dh) / 2;
+        }
+        ctx.drawImage(coverThumbnailImg, dx, dy, dw, dh);
+      } else {
+        renderFrameToCanvas({
+          ctx,
+          width,
+          height,
+          ratio: params.ratio,
+          mediaSource: frameMediaSource,
+          mediaLayers: frameMediaLayers,
+          clipMediaSources: frameClipSources,
+          clipEnvelopeOpacities: frameClipEnvelopes,
+          hiddenVisualTracks: hiddenVisualSet,
+          mediaOpacity: frameMediaOpacity,
+          mediaFit: params.mediaFit,
+          cues: params.cues,
+          currentTime: t,
+          globalOffset: params.globalOffset,
+          enabledTracks: params.enabledTracks,
+          style: params.style,
+          scrollingConfig: params.scrollingConfig,
+          beatEffects: params.beatEffects ?? DEFAULT_BEAT_EFFECTS_CONFIG,
+          effectClips: activeEffectClips,
+          projectDuration: exportDuration,
+          audioAnalysis: frameAudioAnalysis,
+          audioAnalysisTime: frameAudioAnalysisTime,
+          layers: params.layers,
+          layerImages: params.layerImages,
+          farsiFontFamily: params.farsiFontFamily,
+          nastaliqFontFamily: params.nastaliqFontFamily,
+          latinFontFamily: params.latinFontFamily,
+          drawSafeZones: false,
+          drawLayerHandles: false,
+        });
+      }
 
       const timestamp = Math.round((f * 1_000_000) / fps);
       const videoFrame = new VideoFrame(canvas, {

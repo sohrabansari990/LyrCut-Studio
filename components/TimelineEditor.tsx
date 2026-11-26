@@ -38,6 +38,8 @@ import {
   ArrowDown,
   SlidersHorizontal,
   ArrowLeftToLine,
+  BoxSelect,
+  MoveHorizontal,
 } from 'lucide-react';
 import {
   EnabledTracks,
@@ -47,14 +49,21 @@ import {
 import { CanvasLayer, getClipLayerId, hasLayerAnimation } from '@/lib/canvas-layers';
 import {
   AudioTimelineClip,
+  PlayheadSnapResult,
   TimedEffectClip,
   VisualTimelineClip,
   collectTimelineSnapTargets,
+  computeRulerTickStep,
   computeTimelineDisplayDuration,
   getAudioTrackCount,
   getVisualTrackCount,
+  selectCuesInTimeRange,
+  sliceWaveformPeaksForClip,
   snapClipEdgeToTargets,
   snapClipMoveToTargets,
+  snapPlayheadToElements,
+  trimAudioClipLeft,
+  trimAudioClipRight,
 } from '@/lib/timeline-engine';
 import { IconTooltip } from './TooltipButton';
 
@@ -152,6 +161,7 @@ interface TimelineEditorProps {
   selectedCueId: string | null;
   syncTargetIndex: number;
   waveformPeaks: number[];
+  waveformPeaksByUrl?: Record<string, number[]>;
   activeAudioName: string | null;
   markers: TimelineMarker[];
   canUndo: boolean;
@@ -169,12 +179,23 @@ interface TimelineEditorProps {
     startTime: number,
     endTime: number
   ) => void;
+  onPreviewShiftSelectedCues: (
+    beforeCues: LyricCue[],
+    selectedIds: string[],
+    deltaSec: number
+  ) => void;
+  onCommitShiftSelectedCues: (
+    beforeCues: LyricCue[],
+    selectedIds: string[],
+    deltaSec: number
+  ) => void;
   onAddMarker: (time: number) => void;
   onRemoveMarker: (id: string) => void;
   onUndo: () => void;
   onRedo: () => void;
   autoRipple: boolean;
   onToggleAutoRipple: () => void;
+  maxBodyHeightPx?: number;
 }
 
 type DragOperation =
@@ -182,6 +203,9 @@ type DragOperation =
       kind: 'cue';
       mode: 'move' | 'resize-left' | 'resize-right';
       id: string;
+      selectedIds: string[];
+      groupMinStart: number;
+      groupMaxEnd: number;
       startX: number;
       origStart: number;
       origEnd: number;
@@ -209,6 +233,7 @@ type DragOperation =
       origStart: number;
       origEnd: number;
       origSourceStart: number;
+      origSourceDuration: number;
       origTrackIndex: number;
       origFadeIn: number;
       origFadeOut: number;
@@ -223,6 +248,16 @@ type DragOperation =
       origEnd: number;
       snapshot: TimedEffectClip[];
     };
+
+interface MarqueeSelectionState {
+  startX: number;
+  currentX: number;
+  startTime: number;
+  currentTime: number;
+  active: boolean;
+  additive: boolean;
+  initialCueIds: string[];
+}
 
 const HEADER_WIDTH = 144;
 const VISUAL_ROW_HEIGHT = 40;
@@ -290,6 +325,7 @@ export default function TimelineEditor({
   selectedCueId,
   syncTargetIndex,
   waveformPeaks,
+  waveformPeaksByUrl,
   activeAudioName,
   markers,
   canUndo,
@@ -302,12 +338,15 @@ export default function TimelineEditor({
   onChangeGlobalOffset,
   onPreviewCueTiming,
   onCommitCueTiming,
+  onPreviewShiftSelectedCues,
+  onCommitShiftSelectedCues,
   onAddMarker,
   onRemoveMarker,
   onUndo,
   onRedo,
   autoRipple,
   onToggleAutoRipple,
+  maxBodyHeightPx,
 }: TimelineEditorProps) {
   const effectiveVisualTrackCount = Math.max(
     1,
@@ -338,7 +377,11 @@ export default function TimelineEditor({
 
   const [zoom, setZoom] = useState<number>(1);
   const [snapEnabled, setSnapEnabled] = useState<boolean>(true);
+  const [lyricBoxSelectMode, setLyricBoxSelectMode] = useState<boolean>(false);
   const [activeSnapGuideTime, setActiveSnapGuideTime] = useState<number | null>(null);
+  const [playheadSnapInfo, setPlayheadSnapInfo] = useState<PlayheadSnapResult | null>(null);
+  const [playheadSnapPulse, setPlayheadSnapPulse] = useState<boolean>(false);
+  const [marquee, setMarquee] = useState<MarqueeSelectionState | null>(null);
   const [dragOp, setDragOp] = useState<DragOperation | null>(null);
   const [isScrubbing, setIsScrubbing] = useState<boolean>(false);
   const [trackLocks, setTrackLocks] = useState<TimelineTrackLocks>({
@@ -349,6 +392,8 @@ export default function TimelineEditor({
     english: false,
   });
 
+  const lastPlayheadSnapTimeRef = useRef<number | null>(null);
+  const pulseTimerRef = useRef<number | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const trackViewportRef = useRef<HTMLDivElement>(null);
   const [availableTrackWidth, setAvailableTrackWidth] = useState<number>(640);
@@ -445,233 +490,163 @@ export default function TimelineEditor({
     [onSelectCue, onSetSelectedItems, selectedItems]
   );
 
-  // Playhead scrubbing — prevents accidental text selection anywhere on the page
+  const triggerPlayheadSnapFeedback = useCallback((snapTimeVal: number) => {
+    if (
+      lastPlayheadSnapTimeRef.current !== null &&
+      Math.abs(lastPlayheadSnapTimeRef.current - snapTimeVal) < 0.04
+    ) {
+      return;
+    }
+    lastPlayheadSnapTimeRef.current = snapTimeVal;
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      try {
+        navigator.vibrate(10);
+      } catch {
+        // Ignore browser vibration restrictions
+      }
+    }
+    setPlayheadSnapPulse(true);
+    if (pulseTimerRef.current !== null) {
+      window.clearTimeout(pulseTimerRef.current);
+    }
+    pulseTimerRef.current = window.setTimeout(() => {
+      setPlayheadSnapPulse(false);
+    }, 190);
+  }, []);
+
+  const seekWithPlayheadMagnet = useCallback(
+    (clientX: number, bypassMagnet: boolean) => {
+      const rawTime = clientXToTime(clientX);
+      if (snapEnabled && !bypassMagnet) {
+        const thresholdSec = Math.max(
+          0.12,
+          (11 / Math.max(200, trackPixelWidth)) * displayDuration
+        );
+        const snap = snapPlayheadToElements({
+          candidateTime: rawTime,
+          thresholdSec,
+          visualClips,
+          audioClips,
+          effectClips,
+          cues,
+          markers,
+          maxDuration: displayDuration,
+        });
+        if (snap.snapped) {
+          setPlayheadSnapInfo(snap);
+          setActiveSnapGuideTime(snap.time);
+          triggerPlayheadSnapFeedback(snap.time);
+          onSeek(snap.time);
+          return;
+        }
+      }
+      lastPlayheadSnapTimeRef.current = null;
+      setPlayheadSnapInfo(null);
+      setActiveSnapGuideTime(null);
+      onSeek(rawTime);
+    },
+    [
+      audioClips,
+      clientXToTime,
+      cues,
+      displayDuration,
+      effectClips,
+      markers,
+      onSeek,
+      snapEnabled,
+      trackPixelWidth,
+      triggerPlayheadSnapFeedback,
+      visualClips,
+    ]
+  );
+
+  // Playhead scrubbing — magnetically grabs element starts/ends with visual pulse & haptic feedback
   useEffect(() => {
     if (!isScrubbing) return;
     clearDomSelection();
     const onMove = (e: PointerEvent) => {
       e.preventDefault();
       clearDomSelection();
-      onSeek(clientXToTime(e.clientX));
+      seekWithPlayheadMagnet(e.clientX, e.altKey);
     };
-    const onUp = () => setIsScrubbing(false);
+    const onUp = () => {
+      setIsScrubbing(false);
+      setActiveSnapGuideTime(null);
+      setPlayheadSnapInfo(null);
+      lastPlayheadSnapTimeRef.current = null;
+    };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     return () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
-  }, [isScrubbing, clientXToTime, onSeek]);
+  }, [isScrubbing, seekWithPlayheadMagnet]);
 
-  // Unified drag / trim / magnetic snap / vertical track-reordering / audio-fade handling
+  // Left-click drag Marquee Selection across lyric tracks
   useEffect(() => {
-    if (!dragOp) return;
+    if (!marquee) return;
     clearDomSelection();
-
-    let latestStart = dragOp.origStart;
-    let latestEnd = dragOp.origEnd;
-    let latestSourceStart =
-      dragOp.kind === 'visual' || dragOp.kind === 'audio' ? dragOp.origSourceStart : 0;
-    let latestTrackIndex =
-      dragOp.kind === 'visual' || dragOp.kind === 'audio' ? dragOp.origTrackIndex : 0;
-    let latestFadeIn = dragOp.kind === 'audio' ? dragOp.origFadeIn : 0;
-    let latestFadeOut = dragOp.kind === 'audio' ? dragOp.origFadeOut : 0;
-
-    // Collect magnetic snap anchors (all neighbor clip edges, playhead, markers, 0s)
-    const snapTargets = collectTimelineSnapTargets({
-      visualClips: dragOp.kind === 'visual' ? dragOp.snapshot : visualClips,
-      audioClips: dragOp.kind === 'audio' ? dragOp.snapshot : audioClips,
-      effectClips: dragOp.kind === 'fx' ? dragOp.snapshot : effectClips,
-      cues: dragOp.kind === 'cue' ? dragOp.snapshot : cues,
-      markers,
-      currentTime,
-      excludeId: dragOp.id,
-    });
-    const magneticThresholdSec = Math.max(
-      0.1,
-      (10 / Math.max(200, trackPixelWidth)) * displayDuration
-    );
+    let didActivate = marquee.active;
+    let latestTime = marquee.currentTime;
 
     const onMove = (e: PointerEvent) => {
       e.preventDefault();
       clearDomSelection();
-      const deltaPx = e.clientX - dragOp.startX;
-      const deltaSec = (deltaPx / trackPixelWidth) * displayDuration;
-      const clipDur = Math.max(0.25, dragOp.origEnd - dragOp.origStart);
-      const useMagnet = snapEnabled && !e.altKey;
-
-      if (dragOp.kind === 'audio' && dragOp.mode === 'fade-in') {
-        latestFadeIn = Number(
-          Math.max(0, Math.min(clipDur * 0.5, dragOp.origFadeIn + deltaSec)).toFixed(2)
-        );
-        onPreviewAudioClip(dragOp.id, { fadeIn: latestFadeIn });
-        return;
+      const dx = Math.abs(e.clientX - marquee.startX);
+      if (!didActivate && dx >= 5) {
+        didActivate = true;
       }
-
-      if (dragOp.kind === 'audio' && dragOp.mode === 'fade-out') {
-        latestFadeOut = Number(
-          Math.max(0, Math.min(clipDur * 0.5, dragOp.origFadeOut - deltaSec)).toFixed(2)
-        );
-        onPreviewAudioClip(dragOp.id, { fadeOut: latestFadeOut });
-        return;
-      }
-
-      if (dragOp.mode === 'move') {
-        if (useMagnet) {
-          const snapped = snapClipMoveToTargets(
-            dragOp.origStart + deltaSec,
-            clipDur,
-            snapTargets,
-            magneticThresholdSec,
-            displayDuration - 0.25
-          );
-          latestStart = snapped.startTime;
-          latestEnd = snapped.endTime;
-          setActiveSnapGuideTime(snapped.guideTime);
-        } else {
-          const nextStart = Math.max(
-            0,
-            Math.min(displayDuration - 0.25, snapTime(dragOp.origStart + deltaSec))
-          );
-          latestStart = nextStart;
-          latestEnd = Number((nextStart + clipDur).toFixed(2));
-          setActiveSnapGuideTime(null);
+      latestTime = clientXToTime(e.clientX);
+      setMarquee((prev) =>
+        prev
+          ? {
+              ...prev,
+              currentX: e.clientX,
+              currentTime: latestTime,
+              active: didActivate,
+            }
+          : null
+      );
+      if (didActivate) {
+        const hitIds = selectCuesInTimeRange(cues, marquee.startTime, latestTime);
+        const merged = marquee.additive
+          ? Array.from(new Set([...marquee.initialCueIds, ...hitIds]))
+          : hitIds;
+        onSetSelectedItems(merged.map((id) => ({ track: 'cue' as const, id })));
+        if (merged.length > 0) {
+          const firstIdx = cues.findIndex((c) => c.id === merged[0]);
+          onSelectCue(merged[0], firstIdx >= 0 ? firstIdx : undefined);
         }
-
-        // Vertical drag moves clip between stacked tracks!
-        if (dragOp.kind === 'visual') {
-          const deltaY = e.clientY - dragOp.startY;
-          // Visual tracks render top-to-bottom (V3 -> V2 -> V1), so dragging UP increases trackIndex
-          const deltaTracks = Math.round(-deltaY / VISUAL_ROW_HEIGHT);
-          latestTrackIndex = Math.max(
-            0,
-            Math.min(
-              effectiveVisualTrackCount - 1,
-              dragOp.origTrackIndex + deltaTracks
-            )
-          );
-        } else if (dragOp.kind === 'audio') {
-          const deltaY = e.clientY - dragOp.startY;
-          // Audio tracks render top-to-bottom (A1 -> A2 -> A3), so dragging DOWN increases trackIndex
-          const deltaTracks = Math.round(deltaY / AUDIO_ROW_HEIGHT);
-          latestTrackIndex = Math.max(
-            0,
-            Math.min(
-              effectiveAudioTrackCount - 1,
-              dragOp.origTrackIndex + deltaTracks
-            )
-          );
-        }
-      } else if (dragOp.mode === 'resize-left') {
-        const maxStart = dragOp.origEnd - 0.25;
-        if (useMagnet) {
-          const snapped = snapClipEdgeToTargets(
-            dragOp.origStart + deltaSec,
-            snapTargets,
-            magneticThresholdSec,
-            0,
-            maxStart
-          );
-          latestStart = snapped.time;
-          setActiveSnapGuideTime(snapped.guideTime);
-        } else {
-          latestStart = Math.max(
-            0,
-            Math.min(maxStart, snapTime(dragOp.origStart + deltaSec))
-          );
-          setActiveSnapGuideTime(null);
-        }
-        latestEnd = dragOp.origEnd;
-        const shift = latestStart - dragOp.origStart;
-        if (dragOp.kind === 'audio' || (dragOp.kind === 'visual' && dragOp.isVideo)) {
-          latestSourceStart = Number(
-            Math.max(0, dragOp.origSourceStart + shift).toFixed(2)
-          );
-        }
-      } else {
-        const minEnd = dragOp.origStart + 0.25;
-        latestStart = dragOp.origStart;
-        if (useMagnet) {
-          const snapped = snapClipEdgeToTargets(
-            dragOp.origEnd + deltaSec,
-            snapTargets,
-            magneticThresholdSec,
-            minEnd
-          );
-          latestEnd = snapped.time;
-          setActiveSnapGuideTime(snapped.guideTime);
-        } else {
-          latestEnd = Math.max(minEnd, snapTime(dragOp.origEnd + deltaSec));
-          setActiveSnapGuideTime(null);
-        }
-      }
-
-      if (dragOp.kind === 'cue') {
-        onPreviewCueTiming(dragOp.id, latestStart, latestEnd);
-      } else if (dragOp.kind === 'visual') {
-        onPreviewVisualClip(dragOp.id, {
-          startTime: latestStart,
-          endTime: latestEnd,
-          sourceStart: latestSourceStart,
-          trackIndex: latestTrackIndex,
-        });
-      } else if (dragOp.kind === 'audio') {
-        onPreviewAudioClip(dragOp.id, {
-          startTime: latestStart,
-          endTime: latestEnd,
-          sourceStart: latestSourceStart,
-          trackIndex: latestTrackIndex,
-        });
-      } else if (dragOp.kind === 'fx') {
-        onPreviewEffectClip(dragOp.id, {
-          startTime: latestStart,
-          endTime: latestEnd,
-        });
       }
     };
 
-    const onUp = () => {
-      setActiveSnapGuideTime(null);
-      if (dragOp.kind === 'cue') {
-        onCommitCueTiming(dragOp.snapshot, dragOp.id, latestStart, latestEnd);
-      } else if (dragOp.kind === 'visual') {
-        onCommitVisualClip(dragOp.snapshot, dragOp.id, {
-          startTime: latestStart,
-          endTime: latestEnd,
-          sourceStart: latestSourceStart,
-          trackIndex: latestTrackIndex,
-        });
-      } else if (dragOp.kind === 'audio') {
-        if (dragOp.mode === 'fade-in') {
-          onCommitAudioClip(dragOp.snapshot, dragOp.id, { fadeIn: latestFadeIn });
-        } else if (dragOp.mode === 'fade-out') {
-          onCommitAudioClip(dragOp.snapshot, dragOp.id, { fadeOut: latestFadeOut });
-        } else {
-          onCommitAudioClip(dragOp.snapshot, dragOp.id, {
-            startTime: latestStart,
-            endTime: latestEnd,
-            sourceStart: latestSourceStart,
-            trackIndex: latestTrackIndex,
-          });
-        }
-      } else if (dragOp.kind === 'fx') {
-        onCommitEffectClip(dragOp.snapshot, dragOp.id, {
-          startTime: latestStart,
-          endTime: latestEnd,
-        });
+    const onUp = (e: PointerEvent) => {
+      if (!didActivate) {
+        // Simple click without dragging -> deselect and seek playhead
+        onSelectCue(null);
+        onSetSelectedItems([]);
+        seekWithPlayheadMagnet(e.clientX, e.altKey);
       }
-      setDragOp(null);
+      setMarquee(null);
     };
 
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     return () => {
-      setActiveSnapGuideTime(null);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
   }, [
-    dragOp,
+    marquee,
+    clientXToTime,
+    cues,
+    onSelectCue,
+    onSetSelectedItems,
+    seekWithPlayheadMagnet,
+  ]);
+
+  const dragContextRef = useRef({
     trackPixelWidth,
     displayDuration,
     effectiveVisualTrackCount,
@@ -686,23 +661,376 @@ export default function TimelineEditor({
     currentTime,
     onPreviewCueTiming,
     onCommitCueTiming,
+    onPreviewShiftSelectedCues,
+    onCommitShiftSelectedCues,
     onPreviewVisualClip,
     onCommitVisualClip,
     onPreviewAudioClip,
     onCommitAudioClip,
     onPreviewEffectClip,
     onCommitEffectClip,
-  ]);
+  });
+
+  useEffect(() => {
+    dragContextRef.current = {
+      trackPixelWidth,
+      displayDuration,
+      effectiveVisualTrackCount,
+      effectiveAudioTrackCount,
+      snapEnabled,
+      snapTime,
+      visualClips,
+      audioClips,
+      effectClips,
+      cues,
+      markers,
+      currentTime,
+      onPreviewCueTiming,
+      onCommitCueTiming,
+      onPreviewShiftSelectedCues,
+      onCommitShiftSelectedCues,
+      onPreviewVisualClip,
+      onCommitVisualClip,
+      onPreviewAudioClip,
+      onCommitAudioClip,
+      onPreviewEffectClip,
+      onCommitEffectClip,
+    };
+  });
+
+  // Unified drag / trim / group-lyric-move / magnetic snap / vertical track-reordering / audio-fade handling
+  // Depends ONLY on [dragOp] so live preview updates never reset latestStart/latestEnd/latestSourceStart before pointerup!
+  useEffect(() => {
+    if (!dragOp) return;
+    clearDomSelection();
+
+    const startCtx = dragContextRef.current;
+
+    let latestStart = dragOp.origStart;
+    let latestEnd = dragOp.origEnd;
+    let latestGroupDelta = 0;
+    let latestSourceStart =
+      dragOp.kind === 'visual' || dragOp.kind === 'audio' ? dragOp.origSourceStart : 0;
+    let latestTrackIndex =
+      dragOp.kind === 'visual' || dragOp.kind === 'audio' ? dragOp.origTrackIndex : 0;
+    let latestFadeIn = dragOp.kind === 'audio' ? dragOp.origFadeIn : 0;
+    let latestFadeOut = dragOp.kind === 'audio' ? dragOp.origFadeOut : 0;
+
+    // Collect magnetic snap anchors once at drag start (all non-moving clip edges, playhead, markers, 0s)
+    const excludedCueIds =
+      dragOp.kind === 'cue' ? new Set(dragOp.selectedIds) : null;
+    const snapTargets = collectTimelineSnapTargets({
+      visualClips: dragOp.kind === 'visual' ? dragOp.snapshot : startCtx.visualClips,
+      audioClips: dragOp.kind === 'audio' ? dragOp.snapshot : startCtx.audioClips,
+      effectClips: dragOp.kind === 'fx' ? dragOp.snapshot : startCtx.effectClips,
+      cues:
+        dragOp.kind === 'cue'
+          ? dragOp.snapshot.filter((c) => !excludedCueIds?.has(c.id))
+          : startCtx.cues,
+      markers: startCtx.markers,
+      currentTime: startCtx.currentTime,
+      excludeId: dragOp.kind === 'cue' ? undefined : dragOp.id,
+    });
+
+    const onMove = (e: PointerEvent) => {
+      e.preventDefault();
+      clearDomSelection();
+      const ctx = dragContextRef.current;
+      const magneticThresholdSec = Math.max(
+        0.1,
+        (10 / Math.max(200, ctx.trackPixelWidth)) * ctx.displayDuration
+      );
+      const deltaPx = e.clientX - dragOp.startX;
+      const deltaSec = (deltaPx / ctx.trackPixelWidth) * ctx.displayDuration;
+      const clipDur = Math.max(0.25, dragOp.origEnd - dragOp.origStart);
+      const useMagnet = ctx.snapEnabled && !e.altKey;
+
+      if (dragOp.kind === 'audio' && dragOp.mode === 'fade-in') {
+        latestFadeIn = Number(
+          Math.max(0, Math.min(clipDur * 0.5, dragOp.origFadeIn + deltaSec)).toFixed(2)
+        );
+        ctx.onPreviewAudioClip(dragOp.id, { fadeIn: latestFadeIn });
+        return;
+      }
+
+      if (dragOp.kind === 'audio' && dragOp.mode === 'fade-out') {
+        latestFadeOut = Number(
+          Math.max(0, Math.min(clipDur * 0.5, dragOp.origFadeOut - deltaSec)).toFixed(2)
+        );
+        ctx.onPreviewAudioClip(dragOp.id, { fadeOut: latestFadeOut });
+        return;
+      }
+
+      // Multi-selected lyric group drag: slides ALL selected cues forward or backward together!
+      if (dragOp.kind === 'cue' && dragOp.mode === 'move' && dragOp.selectedIds.length > 1) {
+        const groupDur = Math.max(0.25, dragOp.groupMaxEnd - dragOp.groupMinStart);
+        let nextGroupStart: number;
+        if (useMagnet) {
+          const snapped = snapClipMoveToTargets(
+            dragOp.groupMinStart + deltaSec,
+            groupDur,
+            snapTargets,
+            magneticThresholdSec,
+            ctx.displayDuration - 0.25
+          );
+          nextGroupStart = snapped.startTime;
+          setActiveSnapGuideTime(snapped.guideTime);
+        } else {
+          nextGroupStart = Math.max(
+            0,
+            Math.min(ctx.displayDuration - 0.25, ctx.snapTime(dragOp.groupMinStart + deltaSec))
+          );
+          setActiveSnapGuideTime(null);
+        }
+        latestGroupDelta = Number((nextGroupStart - dragOp.groupMinStart).toFixed(2));
+        ctx.onPreviewShiftSelectedCues(dragOp.snapshot, dragOp.selectedIds, latestGroupDelta);
+        return;
+      }
+
+      if (dragOp.mode === 'move') {
+        if (useMagnet) {
+          const snapped = snapClipMoveToTargets(
+            dragOp.origStart + deltaSec,
+            clipDur,
+            snapTargets,
+            magneticThresholdSec,
+            ctx.displayDuration - 0.25
+          );
+          latestStart = snapped.startTime;
+          latestEnd = snapped.endTime;
+          setActiveSnapGuideTime(snapped.guideTime);
+        } else {
+          const nextStart = Math.max(
+            0,
+            Math.min(ctx.displayDuration - 0.25, ctx.snapTime(dragOp.origStart + deltaSec))
+          );
+          latestStart = nextStart;
+          latestEnd = Number((nextStart + clipDur).toFixed(2));
+          setActiveSnapGuideTime(null);
+        }
+
+        // Vertical drag moves clip between stacked tracks!
+        if (dragOp.kind === 'visual') {
+          const deltaY = e.clientY - dragOp.startY;
+          const deltaTracks = Math.round(-deltaY / VISUAL_ROW_HEIGHT);
+          latestTrackIndex = Math.max(
+            0,
+            Math.min(
+              ctx.effectiveVisualTrackCount - 1,
+              dragOp.origTrackIndex + deltaTracks
+            )
+          );
+        } else if (dragOp.kind === 'audio') {
+          const deltaY = e.clientY - dragOp.startY;
+          const deltaTracks = Math.round(deltaY / AUDIO_ROW_HEIGHT);
+          latestTrackIndex = Math.max(
+            0,
+            Math.min(
+              ctx.effectiveAudioTrackCount - 1,
+              dragOp.origTrackIndex + deltaTracks
+            )
+          );
+        }
+      } else if (dragOp.mode === 'resize-left') {
+        if (dragOp.kind === 'audio') {
+          const origClip = dragOp.snapshot.find((c) => c.id === dragOp.id);
+          const minFromSrc = Math.max(0, dragOp.origStart - dragOp.origSourceStart);
+          const maxStart = dragOp.origEnd - 0.25;
+          let candStart: number;
+          if (useMagnet) {
+            const snapped = snapClipEdgeToTargets(
+              dragOp.origStart + deltaSec,
+              snapTargets,
+              magneticThresholdSec,
+              minFromSrc,
+              maxStart
+            );
+            candStart = snapped.time;
+            setActiveSnapGuideTime(snapped.guideTime);
+          } else {
+            candStart = Math.max(
+              minFromSrc,
+              Math.min(maxStart, ctx.snapTime(dragOp.origStart + deltaSec))
+            );
+            setActiveSnapGuideTime(null);
+          }
+          if (origClip) {
+            const trimmed = trimAudioClipLeft(origClip, candStart);
+            latestStart = trimmed.startTime;
+            latestEnd = trimmed.endTime;
+            latestSourceStart = trimmed.sourceStart;
+            latestFadeIn = trimmed.fadeIn;
+            latestFadeOut = trimmed.fadeOut;
+          }
+        } else {
+          const maxStart = dragOp.origEnd - 0.25;
+          if (useMagnet) {
+            const snapped = snapClipEdgeToTargets(
+              dragOp.origStart + deltaSec,
+              snapTargets,
+              magneticThresholdSec,
+              0,
+              maxStart
+            );
+            latestStart = snapped.time;
+            setActiveSnapGuideTime(snapped.guideTime);
+          } else {
+            latestStart = Math.max(
+              0,
+              Math.min(maxStart, ctx.snapTime(dragOp.origStart + deltaSec))
+            );
+            setActiveSnapGuideTime(null);
+          }
+          latestEnd = dragOp.origEnd;
+          const shift = latestStart - dragOp.origStart;
+          if (dragOp.kind === 'visual' && dragOp.isVideo) {
+            latestSourceStart = Number(
+              Math.max(0, dragOp.origSourceStart + shift).toFixed(2)
+            );
+          }
+        }
+      } else {
+        if (dragOp.kind === 'audio') {
+          const origClip = dragOp.snapshot.find((c) => c.id === dragOp.id);
+          const minEnd = dragOp.origStart + 0.25;
+          const maxEnd =
+            dragOp.origSourceDuration > 0.25
+              ? Math.max(
+                  minEnd,
+                  dragOp.origStart +
+                    Math.max(0.25, dragOp.origSourceDuration - dragOp.origSourceStart)
+                )
+              : undefined;
+          let candEnd: number;
+          if (useMagnet) {
+            const snapped = snapClipEdgeToTargets(
+              dragOp.origEnd + deltaSec,
+              snapTargets,
+              magneticThresholdSec,
+              minEnd,
+              maxEnd
+            );
+            candEnd = snapped.time;
+            setActiveSnapGuideTime(snapped.guideTime);
+          } else {
+            const raw = Math.max(minEnd, ctx.snapTime(dragOp.origEnd + deltaSec));
+            candEnd = maxEnd !== undefined ? Math.min(maxEnd, raw) : raw;
+            setActiveSnapGuideTime(null);
+          }
+          if (origClip) {
+            const trimmed = trimAudioClipRight(origClip, candEnd);
+            latestStart = trimmed.startTime;
+            latestEnd = trimmed.endTime;
+            latestSourceStart = trimmed.sourceStart;
+            latestFadeIn = trimmed.fadeIn;
+            latestFadeOut = trimmed.fadeOut;
+          }
+        } else {
+          const minEnd = dragOp.origStart + 0.25;
+          latestStart = dragOp.origStart;
+          if (useMagnet) {
+            const snapped = snapClipEdgeToTargets(
+              dragOp.origEnd + deltaSec,
+              snapTargets,
+              magneticThresholdSec,
+              minEnd
+            );
+            latestEnd = snapped.time;
+            setActiveSnapGuideTime(snapped.guideTime);
+          } else {
+            latestEnd = Math.max(minEnd, ctx.snapTime(dragOp.origEnd + deltaSec));
+            setActiveSnapGuideTime(null);
+          }
+        }
+      }
+
+      if (dragOp.kind === 'cue') {
+        ctx.onPreviewCueTiming(dragOp.id, latestStart, latestEnd);
+      } else if (dragOp.kind === 'visual') {
+        ctx.onPreviewVisualClip(dragOp.id, {
+          startTime: latestStart,
+          endTime: latestEnd,
+          sourceStart: latestSourceStart,
+          trackIndex: latestTrackIndex,
+        });
+      } else if (dragOp.kind === 'audio') {
+        ctx.onPreviewAudioClip(dragOp.id, {
+          startTime: latestStart,
+          endTime: latestEnd,
+          sourceStart: latestSourceStart,
+          trackIndex: latestTrackIndex,
+          fadeIn: latestFadeIn,
+          fadeOut: latestFadeOut,
+        });
+      } else if (dragOp.kind === 'fx') {
+        ctx.onPreviewEffectClip(dragOp.id, {
+          startTime: latestStart,
+          endTime: latestEnd,
+        });
+      }
+    };
+
+    const onUp = () => {
+      const ctx = dragContextRef.current;
+      setActiveSnapGuideTime(null);
+      if (dragOp.kind === 'cue') {
+        if (dragOp.mode === 'move' && dragOp.selectedIds.length > 1) {
+          ctx.onCommitShiftSelectedCues(
+            dragOp.snapshot,
+            dragOp.selectedIds,
+            latestGroupDelta
+          );
+        } else {
+          ctx.onCommitCueTiming(dragOp.snapshot, dragOp.id, latestStart, latestEnd);
+        }
+      } else if (dragOp.kind === 'visual') {
+        ctx.onCommitVisualClip(dragOp.snapshot, dragOp.id, {
+          startTime: latestStart,
+          endTime: latestEnd,
+          sourceStart: latestSourceStart,
+          trackIndex: latestTrackIndex,
+        });
+      } else if (dragOp.kind === 'audio') {
+        if (dragOp.mode === 'fade-in') {
+          ctx.onCommitAudioClip(dragOp.snapshot, dragOp.id, { fadeIn: latestFadeIn });
+        } else if (dragOp.mode === 'fade-out') {
+          ctx.onCommitAudioClip(dragOp.snapshot, dragOp.id, { fadeOut: latestFadeOut });
+        } else {
+          ctx.onCommitAudioClip(dragOp.snapshot, dragOp.id, {
+            startTime: latestStart,
+            endTime: latestEnd,
+            sourceStart: latestSourceStart,
+            trackIndex: latestTrackIndex,
+            fadeIn: latestFadeIn,
+            fadeOut: latestFadeOut,
+          });
+        }
+      } else if (dragOp.kind === 'fx') {
+        ctx.onCommitEffectClip(dragOp.snapshot, dragOp.id, {
+          startTime: latestStart,
+          endTime: latestEnd,
+        });
+      }
+      setDragOp(null);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      setActiveSnapGuideTime(null);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, [dragOp]);
 
   const rulerTicks = useMemo(() => {
-    const step =
-      zoom >= 4 ? 1 : zoom >= 2 ? 2 : displayDuration > 180 ? 20 : displayDuration > 90 ? 10 : 5;
+    const step = computeRulerTickStep(displayDuration, trackPixelWidth, 68);
     const ticks: number[] = [];
-    for (let t = 0; t <= displayDuration; t += step) {
+    for (let t = 0; t <= displayDuration + 0.001; t += step) {
       ticks.push(Number(t.toFixed(1)));
     }
     return ticks;
-  }, [displayDuration, zoom]);
+  }, [displayDuration, trackPixelWidth]);
 
   const targetCue = cues[syncTargetIndex] ?? null;
   const activeCueId = useMemo(() => {
@@ -722,6 +1050,12 @@ export default function TimelineEditor({
     if (!sel) return null;
     return audioClips.find((c) => c.id === sel.id) ?? null;
   }, [audioClips, selectedItems]);
+
+  const selectedCueIds = useMemo(() => {
+    const ids = selectedItems.filter((s) => s.track === 'cue').map((s) => s.id);
+    if (ids.length > 0) return ids;
+    return selectedCueId ? [selectedCueId] : [];
+  }, [selectedItems, selectedCueId]);
 
   const animatedOverlayLayers = useMemo(
     () =>
@@ -784,7 +1118,7 @@ export default function TimelineEditor({
     e.preventDefault();
     clearDomSelection();
     setIsScrubbing(true);
-    onSeek(clientXToTime(e.clientX));
+    seekWithPlayheadMagnet(e.clientX, e.altKey);
   };
 
   return (
@@ -955,6 +1289,29 @@ export default function TimelineEditor({
             </button>
           </IconTooltip>
 
+          <IconTooltip
+            tip={
+              lyricBoxSelectMode
+                ? 'Marquee Box Select Lyrics: ON — drag across any lyrics to multi-select'
+                : 'Marquee Box Select Lyrics — hold left click & drag across lyrics to select multiple lines'
+            }
+          >
+            <button
+              type="button"
+              onClick={() => setLyricBoxSelectMode((v) => !v)}
+              aria-pressed={lyricBoxSelectMode}
+              aria-label="Toggle marquee box selection for lyrics"
+              data-testid="timeline-box-select-btn"
+              className={`p-1.5 rounded border cursor-pointer ${
+                lyricBoxSelectMode
+                  ? 'bg-sky-500/25 border-sky-400/55 text-sky-200'
+                  : 'bg-[#191D26] border-white/8 text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              <BoxSelect className="w-3.5 h-3.5" aria-hidden="true" />
+            </button>
+          </IconTooltip>
+
           <span className="w-px h-4 bg-white/10 mx-0.5" aria-hidden="true" />
 
           <IconTooltip tip="Add a new stacked Video/Image layer track (V2, V3...)">
@@ -1087,12 +1444,61 @@ export default function TimelineEditor({
         ) : selectedAudioClip ? (
           <div
             data-testid="audio-fade-toolbar"
-            className="flex items-center gap-1.5 text-[10px] bg-[#161A22] px-2 py-0.5 rounded-md border border-emerald-500/30"
+            className="flex items-center gap-1.5 text-[10px] bg-[#161A22] px-2 py-0.5 rounded-md border border-emerald-500/30 flex-wrap"
           >
             <span className="font-mono font-semibold text-emerald-300">
               A{(selectedAudioClip.trackIndex ?? 0) + 1}
             </span>
             <SlidersHorizontal className="w-3 h-3 text-emerald-400 shrink-0" aria-hidden="true" />
+            <label className="flex items-center gap-1 text-zinc-300">
+              <span>Start</span>
+              <input
+                type="number"
+                min={0}
+                max={Number(Math.max(0, selectedAudioClip.endTime - 0.25).toFixed(2))}
+                step={0.5}
+                aria-label="Trim audio clip start seconds"
+                data-testid="audio-trim-start-input"
+                value={Number(selectedAudioClip.startTime.toFixed(2))}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  if (!Number.isFinite(val)) return;
+                  const trimmed = trimAudioClipLeft(selectedAudioClip, val);
+                  onCommitAudioClip(audioClips, selectedAudioClip.id, {
+                    startTime: trimmed.startTime,
+                    endTime: trimmed.endTime,
+                    sourceStart: trimmed.sourceStart,
+                    fadeIn: trimmed.fadeIn,
+                    fadeOut: trimmed.fadeOut,
+                  });
+                }}
+                className="w-12 bg-[#090B0F] text-amber-300 font-mono px-1 py-0.5 rounded border border-white/10"
+              />
+            </label>
+            <label className="flex items-center gap-1 text-zinc-300">
+              <span>End</span>
+              <input
+                type="number"
+                min={Number((selectedAudioClip.startTime + 0.25).toFixed(2))}
+                step={0.5}
+                aria-label="Trim audio clip end seconds"
+                data-testid="audio-trim-end-input"
+                value={Number(selectedAudioClip.endTime.toFixed(2))}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  if (!Number.isFinite(val)) return;
+                  const trimmed = trimAudioClipRight(selectedAudioClip, val);
+                  onCommitAudioClip(audioClips, selectedAudioClip.id, {
+                    startTime: trimmed.startTime,
+                    endTime: trimmed.endTime,
+                    sourceStart: trimmed.sourceStart,
+                    fadeIn: trimmed.fadeIn,
+                    fadeOut: trimmed.fadeOut,
+                  });
+                }}
+                className="w-12 bg-[#090B0F] text-amber-300 font-mono px-1 py-0.5 rounded border border-white/10"
+              />
+            </label>
             <label className="flex items-center gap-1 text-zinc-300">
               <span>In</span>
               <input
@@ -1106,9 +1512,8 @@ export default function TimelineEditor({
                   const val = Math.max(0, Number(e.target.value) || 0);
                   onCommitAudioClip(audioClips, selectedAudioClip.id, { fadeIn: val });
                 }}
-                className="w-11 bg-[#090B0F] text-emerald-300 font-mono px-1 py-0.5 rounded border border-white/10"
+                className="w-10 bg-[#090B0F] text-emerald-300 font-mono px-1 py-0.5 rounded border border-white/10"
               />
-              <span className="text-zinc-500">s</span>
             </label>
             <label className="flex items-center gap-1 text-zinc-300">
               <span>Out</span>
@@ -1123,9 +1528,8 @@ export default function TimelineEditor({
                   const val = Math.max(0, Number(e.target.value) || 0);
                   onCommitAudioClip(audioClips, selectedAudioClip.id, { fadeOut: val });
                 }}
-                className="w-11 bg-[#090B0F] text-emerald-300 font-mono px-1 py-0.5 rounded border border-white/10"
+                className="w-10 bg-[#090B0F] text-emerald-300 font-mono px-1 py-0.5 rounded border border-white/10"
               />
-              <span className="text-zinc-500">s</span>
             </label>
             <label className="flex items-center gap-1 text-zinc-300">
               <span>Vol</span>
@@ -1140,9 +1544,52 @@ export default function TimelineEditor({
                   const vol = Math.max(0, Math.min(1, Number(e.target.value) / 100));
                   onCommitAudioClip(audioClips, selectedAudioClip.id, { volume: vol });
                 }}
-                className="w-11 accent-emerald-400 cursor-pointer"
+                className="w-10 accent-emerald-400 cursor-pointer"
               />
             </label>
+          </div>
+        ) : selectedCueIds.length >= 2 ? (
+          <div
+            data-testid="lyric-group-toolbar"
+            className="flex items-center gap-1.5 text-[10px] bg-[#161A22] px-2 py-0.5 rounded-md border border-sky-400/35"
+          >
+            <MoveHorizontal className="w-3 h-3 text-sky-300 shrink-0" aria-hidden="true" />
+            <span className="font-mono font-semibold text-sky-200">
+              {selectedCueIds.length} lyrics
+            </span>
+            <IconTooltip tip="Move selected lyrics earlier by 0.5s">
+              <button
+                type="button"
+                onClick={() => onCommitShiftSelectedCues(cues, selectedCueIds, -0.5)}
+                className="px-1.5 py-0.5 rounded bg-[#0E1117] hover:bg-sky-500/20 text-zinc-200 font-mono border border-white/10 cursor-pointer"
+              >
+                -0.5s
+              </button>
+            </IconTooltip>
+            <IconTooltip tip="Move selected lyrics later by 0.5s">
+              <button
+                type="button"
+                onClick={() => onCommitShiftSelectedCues(cues, selectedCueIds, 0.5)}
+                className="px-1.5 py-0.5 rounded bg-[#0E1117] hover:bg-sky-500/20 text-zinc-200 font-mono border border-white/10 cursor-pointer"
+              >
+                +0.5s
+              </button>
+            </IconTooltip>
+            <IconTooltip tip="Align first selected lyric to red playhead (moves entire selection together)">
+              <button
+                type="button"
+                data-testid="move-lyrics-to-playhead-btn"
+                onClick={() => {
+                  const selCues = cues.filter((c) => selectedCueIds.includes(c.id));
+                  if (selCues.length === 0) return;
+                  const minStart = Math.min(...selCues.map((c) => c.startTime));
+                  onCommitShiftSelectedCues(cues, selectedCueIds, currentTime - minStart);
+                }}
+                className="px-2 py-0.5 rounded bg-sky-500/25 hover:bg-sky-500/40 text-sky-100 font-semibold border border-sky-400/40 cursor-pointer whitespace-nowrap"
+              >
+                To Playhead
+              </button>
+            </IconTooltip>
           </div>
         ) : (
           <div className="flex items-center gap-1.5 min-w-0">
@@ -1260,7 +1707,10 @@ export default function TimelineEditor({
       <div
         ref={scrollContainerRef}
         data-testid="pro-timeline"
-        className="overflow-x-auto overflow-y-auto max-h-[245px] bg-[#090B0F] relative select-none"
+        style={maxBodyHeightPx ? { maxHeight: `${maxBodyHeightPx}px` } : undefined}
+        className={`overflow-x-auto overflow-y-auto bg-[#090B0F] relative select-none ${
+          maxBodyHeightPx ? '' : 'max-h-[245px]'
+        }`}
       >
         <div
           className="relative flex flex-col select-none"
@@ -1837,7 +2287,7 @@ export default function TimelineEditor({
                       const leftPx =
                         (clip.startTime / displayDuration) * trackPixelWidth;
                       const widthPx = Math.max(
-                        28,
+                        32,
                         (clipDur / displayDuration) * trackPixelWidth
                       );
                       const fadeInPx = Math.min(
@@ -1849,6 +2299,20 @@ export default function TimelineEditor({
                         (clip.fadeOut / clipDur) * widthPx
                       );
                       const selected = isItemSelected('audio', clip.id);
+                      const rawClipPeaks =
+                        waveformPeaksByUrl?.[clip.url] ??
+                        (trackIdx === 0 && idx === 0 ? waveformPeaks : []);
+                      const desiredBars = Math.max(
+                        24,
+                        Math.min(180, Math.round(widthPx / 3.5))
+                      );
+                      const slicedPeaks = sliceWaveformPeaksForClip(
+                        rawClipPeaks,
+                        clip.sourceStart,
+                        clipDur,
+                        clip.sourceDuration,
+                        desiredBars
+                      );
 
                       return (
                         <div
@@ -1877,6 +2341,7 @@ export default function TimelineEditor({
                               origStart: clip.startTime,
                               origEnd: clip.endTime,
                               origSourceStart: clip.sourceStart,
+                              origSourceDuration: clip.sourceDuration,
                               origTrackIndex: clip.trackIndex ?? 0,
                               origFadeIn: clip.fadeIn,
                               origFadeOut: clip.fadeOut,
@@ -1886,24 +2351,24 @@ export default function TimelineEditor({
                           style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
                           title={`${clip.name} (A${trackIdx + 1} · ${formatTimecode(
                             clip.startTime
-                          )} → ${formatTimecode(clip.endTime)}) · Fade In ${
-                            clip.fadeIn
-                          }s / Out ${clip.fadeOut}s`}
-                          className={`absolute top-0.5 bottom-0.5 rounded overflow-hidden border flex items-end select-none ${
+                          )} → ${formatTimecode(clip.endTime)} · src ${clip.sourceStart.toFixed(
+                            1
+                          )}s) · Drag left/right edges to shrink · Drag amber dots for Fade In/Out`}
+                          className={`group/audio absolute top-0.5 bottom-0.5 rounded overflow-hidden border flex items-end select-none ${
                             isTrackLocked
                               ? 'cursor-not-allowed'
                               : 'cursor-grab active:cursor-grabbing'
                           } ${
                             selected
-                              ? 'border-amber-400 ring-1 ring-amber-400/60 z-10 bg-emerald-950/60'
+                              ? 'border-amber-400 ring-1 ring-amber-400/60 z-10 bg-emerald-950/65'
                               : isExtra
-                              ? 'border-teal-400/45 bg-teal-950/45'
-                              : 'border-emerald-400/45 bg-emerald-950/45'
+                              ? 'border-teal-400/45 bg-teal-950/50'
+                              : 'border-emerald-400/45 bg-emerald-950/50'
                           }`}
                         >
                           {/* Detected Beat Ticks inside primary audio clip */}
                           {beatTimes.length > 0 && trackIdx === 0 && idx === 0 && (
-                            <div className="absolute inset-x-0 top-0 h-1.5 pointer-events-none">
+                            <div className="absolute inset-x-0 top-0 h-1.5 pointer-events-none z-10">
                               {beatTimes.slice(0, 180).map((bt, bi) => {
                                 if (
                                   bt < clip.sourceStart ||
@@ -1922,20 +2387,29 @@ export default function TimelineEditor({
                             </div>
                           )}
 
-                          {/* Waveform Bars */}
-                          <div className="absolute inset-x-1 bottom-0.5 top-2 flex items-end gap-[1.5px] pointer-events-none">
-                            {(waveformPeaks.length > 0
-                              ? waveformPeaks
-                              : [0.3, 0.5, 0.4, 0.6]
-                            ).map((peak, pi) => (
-                              <div
-                                key={pi}
-                                className={`flex-1 rounded-t-[1px] ${
-                                  isExtra ? 'bg-teal-400/55' : 'bg-emerald-400/55'
-                                }`}
-                                style={{ height: `${Math.max(14, peak * 90)}%` }}
-                              />
-                            ))}
+                          {/* Real Mirrored Audio Waveform Bars sliced to [sourceStart, sourceStart + clipDur] */}
+                          <div
+                            data-testid={`audio-waveform-${trackIdx}-${idx}`}
+                            className="absolute inset-x-2 inset-y-1 flex items-center gap-[1px] pointer-events-none"
+                          >
+                            {slicedPeaks.map((peak, pi) => {
+                              const pct = Math.max(12, Math.min(96, Math.round(peak * 94)));
+                              return (
+                                <div
+                                  key={pi}
+                                  className="flex-1 h-full flex flex-col items-center justify-center"
+                                >
+                                  <div
+                                    className={`w-full rounded-full ${
+                                      isExtra ? 'bg-teal-300/80' : 'bg-emerald-300/80'
+                                    }`}
+                                    style={{ height: `${pct}%` }}
+                                  />
+                                </div>
+                              );
+                            })}
+                            {/* Subtle waveform centerline */}
+                            <div className="absolute inset-x-0 top-1/2 h-px bg-white/15" />
                           </div>
 
                           {/* Visual Fade-In & Fade-Out Diagonal Curve Shading */}
@@ -1959,7 +2433,7 @@ export default function TimelineEditor({
                           )}
 
                           {/* Clip Label */}
-                          <span className="relative z-10 px-2 pb-0.5 text-[9px] font-medium text-emerald-100/95 truncate pointer-events-none drop-shadow">
+                          <span className="relative z-10 px-3 pb-0.5 text-[9px] font-medium text-emerald-50/95 truncate pointer-events-none drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]">
                             {clip.name}
                             {(clip.fadeIn > 0 || clip.fadeOut > 0) && (
                               <span className="ml-1.5 text-amber-300 font-mono">
@@ -1969,7 +2443,7 @@ export default function TimelineEditor({
                             )}
                           </span>
 
-                          {/* Interactive Top-Left Fade-In Handle */}
+                          {/* Interactive Top-Left Fade-In Handle (inset so left trim handle is always easy to grab) */}
                           {!isTrackLocked && (
                             <button
                               type="button"
@@ -1989,18 +2463,19 @@ export default function TimelineEditor({
                                   origStart: clip.startTime,
                                   origEnd: clip.endTime,
                                   origSourceStart: clip.sourceStart,
+                                  origSourceDuration: clip.sourceDuration,
                                   origTrackIndex: clip.trackIndex ?? 0,
                                   origFadeIn: clip.fadeIn,
                                   origFadeOut: clip.fadeOut,
                                   snapshot: audioClips.map((c) => ({ ...c })),
                                 });
                               }}
-                              style={{ left: `${Math.max(2, fadeInPx)}px` }}
+                              style={{ left: `${Math.max(12, fadeInPx)}px` }}
                               className="absolute top-0.5 z-20 w-2.5 h-2.5 rounded-full bg-amber-400 border border-zinc-950 cursor-ew-resize hover:scale-125 transition-transform"
                             />
                           )}
 
-                          {/* Interactive Top-Right Fade-Out Handle */}
+                          {/* Interactive Top-Right Fade-Out Handle (inset so right trim handle is always easy to grab) */}
                           {!isTrackLocked && (
                             <button
                               type="button"
@@ -2020,21 +2495,24 @@ export default function TimelineEditor({
                                   origStart: clip.startTime,
                                   origEnd: clip.endTime,
                                   origSourceStart: clip.sourceStart,
+                                  origSourceDuration: clip.sourceDuration,
                                   origTrackIndex: clip.trackIndex ?? 0,
                                   origFadeIn: clip.fadeIn,
                                   origFadeOut: clip.fadeOut,
                                   snapshot: audioClips.map((c) => ({ ...c })),
                                 });
                               }}
-                              style={{ right: `${Math.max(2, fadeOutPx)}px` }}
+                              style={{ right: `${Math.max(12, fadeOutPx)}px` }}
                               className="absolute top-0.5 z-20 w-2.5 h-2.5 rounded-full bg-amber-400 border border-zinc-950 cursor-ew-resize hover:scale-125 transition-transform"
                             />
                           )}
 
-                          {/* Left & Right Trim Handles */}
+                          {/* Unobstructed High-Priority Left & Right Audio Shrink/Trim Handles */}
                           <div
                             role="separator"
+                            data-testid={`audio-trim-left-${trackIdx}-${idx}`}
                             aria-label={`Trim start of audio clip ${clip.name}`}
+                            title="Drag right to shrink/trim audio start"
                             onPointerDown={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
@@ -2050,17 +2528,22 @@ export default function TimelineEditor({
                                 origStart: clip.startTime,
                                 origEnd: clip.endTime,
                                 origSourceStart: clip.sourceStart,
+                                origSourceDuration: clip.sourceDuration,
                                 origTrackIndex: clip.trackIndex ?? 0,
                                 origFadeIn: clip.fadeIn,
                                 origFadeOut: clip.fadeOut,
                                 snapshot: audioClips.map((c) => ({ ...c })),
                               });
                             }}
-                            className="absolute left-0 top-0 bottom-0 z-10 w-1.5 cursor-ew-resize hover:bg-amber-400/70"
-                          />
+                            className="absolute left-0 top-0 bottom-0 z-30 w-2.5 cursor-ew-resize flex items-center justify-center bg-emerald-400/20 hover:bg-amber-400/85 transition-colors"
+                          >
+                            <span className="w-[2px] h-4 rounded-full bg-white/70 pointer-events-none" />
+                          </div>
                           <div
                             role="separator"
+                            data-testid={`audio-trim-right-${trackIdx}-${idx}`}
                             aria-label={`Trim end of audio clip ${clip.name}`}
+                            title="Drag left to shrink/trim audio end"
                             onPointerDown={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
@@ -2076,14 +2559,17 @@ export default function TimelineEditor({
                                 origStart: clip.startTime,
                                 origEnd: clip.endTime,
                                 origSourceStart: clip.sourceStart,
+                                origSourceDuration: clip.sourceDuration,
                                 origTrackIndex: clip.trackIndex ?? 0,
                                 origFadeIn: clip.fadeIn,
                                 origFadeOut: clip.fadeOut,
                                 snapshot: audioClips.map((c) => ({ ...c })),
                               });
                             }}
-                            className="absolute right-0 top-0 bottom-0 z-10 w-1.5 cursor-ew-resize hover:bg-amber-400/70"
-                          />
+                            className="absolute right-0 top-0 bottom-0 z-30 w-2.5 cursor-ew-resize flex items-center justify-center bg-emerald-400/20 hover:bg-amber-400/85 transition-colors"
+                          >
+                            <span className="w-[2px] h-4 rounded-full bg-white/70 pointer-events-none" />
+                          </div>
                         </div>
                       );
                     })}
@@ -2406,19 +2892,28 @@ export default function TimelineEditor({
                   </div>
                 </div>
                 <div
+                  data-testid={`lyric-lane-${row.key}`}
                   onPointerDown={(e) => {
-                    if (e.target === e.currentTarget) {
+                    if (e.button !== 0) return;
+                    if (e.target === e.currentTarget || lyricBoxSelectMode) {
                       e.preventDefault();
                       clearDomSelection();
-                      onSelectCue(null);
-                      onSetSelectedItems([]);
-                      setIsScrubbing(true);
-                      onSeek(clientXToTime(e.clientX));
+                      const t = clientXToTime(e.clientX);
+                      const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+                      setMarquee({
+                        startX: e.clientX,
+                        currentX: e.clientX,
+                        startTime: t,
+                        currentTime: t,
+                        active: lyricBoxSelectMode,
+                        additive,
+                        initialCueIds: additive ? [...selectedCueIds] : [],
+                      });
                     }
                   }}
                   className={`relative flex-1 bg-[#080A0E] transition-opacity ${
-                    row.visible ? 'opacity-100' : 'opacity-30'
-                  }`}
+                    lyricBoxSelectMode ? 'cursor-crosshair' : 'cursor-default'
+                  } ${row.visible ? 'opacity-100' : 'opacity-30'}`}
                 >
                   {cues.map((cue, idx) => {
                     const text =
@@ -2443,12 +2938,43 @@ export default function TimelineEditor({
                         key={`${row.key}-${cue.id}`}
                         data-testid={`timeline-cue-${row.key}-${idx}`}
                         onPointerDown={(e) => {
+                          if (e.button !== 0) return;
                           e.preventDefault();
                           e.stopPropagation();
                           clearDomSelection();
+                          if (lyricBoxSelectMode) {
+                            const t = clientXToTime(e.clientX);
+                            const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+                            setMarquee({
+                              startX: e.clientX,
+                              currentX: e.clientX,
+                              startTime: t,
+                              currentTime: t,
+                              active: true,
+                              additive,
+                              initialCueIds: additive ? [...selectedCueIds] : [],
+                            });
+                            return;
+                          }
                           const multi = e.shiftKey || e.metaKey || e.ctrlKey;
-                          handleSelectItem('cue', cue.id, multi, idx);
+                          const alreadyInGroup =
+                            !multi &&
+                            selectedCueIds.length > 1 &&
+                            selectedCueIds.includes(cue.id);
+                          if (!alreadyInGroup) {
+                            handleSelectItem('cue', cue.id, multi, idx);
+                          }
                           if (row.locked || multi) return;
+                          const activeIds = alreadyInGroup ? [...selectedCueIds] : [cue.id];
+                          const groupCues = cues.filter((c) => activeIds.includes(c.id));
+                          const groupMinStart =
+                            groupCues.length > 0
+                              ? Math.min(...groupCues.map((c) => c.startTime))
+                              : cue.startTime;
+                          const groupMaxEnd =
+                            groupCues.length > 0
+                              ? Math.max(...groupCues.map((c) => c.endTime))
+                              : cue.endTime;
                           setDragOp({
                             kind: 'cue',
                             mode: 'move',
@@ -2456,15 +2982,22 @@ export default function TimelineEditor({
                             startX: e.clientX,
                             origStart: cue.startTime,
                             origEnd: cue.endTime,
+                            selectedIds: activeIds,
+                            groupMinStart,
+                            groupMaxEnd,
                             snapshot: cues.map((c) => ({ ...c })),
                           });
                         }}
                         style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
                         title={`${text} (${formatTimecode(cue.startTime)} → ${formatTimecode(
                           cue.endTime
-                        )}) · Shift+Click to multi-select`}
+                        )}) · Drag empty lane or Box Select to select multiple · Drag selected group to shift together`}
                         className={`group absolute top-0.5 bottom-0.5 rounded border text-[10px] flex items-center overflow-hidden select-none transition-colors ${
-                          row.locked ? 'cursor-not-allowed' : 'cursor-grab active:cursor-grabbing'
+                          lyricBoxSelectMode
+                            ? 'cursor-crosshair'
+                            : row.locked
+                            ? 'cursor-not-allowed'
+                            : 'cursor-grab active:cursor-grabbing'
                         } ${
                           isSelected
                             ? 'bg-amber-500/55 border-amber-200 text-white font-semibold z-10'
@@ -2477,6 +3010,7 @@ export default function TimelineEditor({
                           role="separator"
                           aria-label={`Resize start of cue ${idx + 1}`}
                           onPointerDown={(e) => {
+                            if (lyricBoxSelectMode) return;
                             e.preventDefault();
                             e.stopPropagation();
                             clearDomSelection();
@@ -2489,6 +3023,9 @@ export default function TimelineEditor({
                               startX: e.clientX,
                               origStart: cue.startTime,
                               origEnd: cue.endTime,
+                              selectedIds: [cue.id],
+                              groupMinStart: cue.startTime,
+                              groupMaxEnd: cue.endTime,
                               snapshot: cues.map((c) => ({ ...c })),
                             });
                           }}
@@ -2503,6 +3040,7 @@ export default function TimelineEditor({
                           role="separator"
                           aria-label={`Resize end of cue ${idx + 1}`}
                           onPointerDown={(e) => {
+                            if (lyricBoxSelectMode) return;
                             e.preventDefault();
                             e.stopPropagation();
                             clearDomSelection();
@@ -2515,6 +3053,9 @@ export default function TimelineEditor({
                               startX: e.clientX,
                               origStart: cue.startTime,
                               origEnd: cue.endTime,
+                              selectedIds: [cue.id],
+                              groupMinStart: cue.startTime,
+                              groupMaxEnd: cue.endTime,
                               snapshot: cues.map((c) => ({ ...c })),
                             });
                           }}
@@ -2525,12 +3066,31 @@ export default function TimelineEditor({
                       </div>
                     );
                   })}
+
+                  {/* Live Rubber-Band Marquee Box Overlay across Lyric Tracks */}
+                  {marquee?.active && (
+                    <div
+                      data-testid={row.key === 'primary' ? 'lyric-marquee-box' : undefined}
+                      style={{
+                        left: `${
+                          (Math.min(marquee.startTime, marquee.currentTime) / displayDuration) *
+                          trackPixelWidth
+                        }px`,
+                        width: `${Math.max(
+                          4,
+                          (Math.abs(marquee.currentTime - marquee.startTime) / displayDuration) *
+                            trackPixelWidth
+                        )}px`,
+                      }}
+                      className="absolute top-0 bottom-0 bg-sky-400/20 border-x border-sky-300/90 pointer-events-none z-20"
+                    />
+                  )}
                 </div>
               </div>
             );
           })}
 
-          {/* Magnetic Snap Guide Line (visible while dragging/trimming onto a neighbor or marker) */}
+          {/* Magnetic Snap Guide Line (Emerald laser when 2+ elements align at the same timestamp) */}
           {activeSnapGuideTime !== null && (
             <div
               data-testid="timeline-snap-guide"
@@ -2539,20 +3099,49 @@ export default function TimelineEditor({
                   HEADER_WIDTH + (activeSnapGuideTime / displayDuration) * trackPixelWidth
                 }px`,
               }}
-              className="absolute top-0 bottom-0 w-[2px] bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.9)] z-30 pointer-events-none"
+              className={`absolute top-0 bottom-0 w-[2px] z-30 pointer-events-none ${
+                playheadSnapInfo?.isMultiAligned
+                  ? 'bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.95)]'
+                  : 'bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.9)]'
+              }`}
             />
           )}
 
-          {/* Global Playhead Line with Interactive Scrubber Handle & Quick Split Badge */}
+          {/* Global Playhead Line with Magnetic Grab Vibration Pulse, Alignment Badge & Quick Split */}
           <div
             style={{ left: `${HEADER_WIDTH + playheadPx}px` }}
-            className="absolute top-0 bottom-0 w-[2px] bg-rose-500 z-30 pointer-events-none"
+            className={`absolute top-0 bottom-0 w-[2px] z-30 pointer-events-none transition-colors ${
+              playheadSnapPulse
+                ? 'bg-amber-300 shadow-[0_0_10px_rgba(251,191,36,0.95)]'
+                : 'bg-rose-500'
+            }`}
           >
             <div
+              data-testid="timeline-playhead-pin"
               onPointerDown={startScrub}
-              title="Drag playhead"
-              className="pointer-events-auto w-3 h-3 -ml-[5px] bg-rose-500 rounded-b-sm cursor-ew-resize shadow"
+              title="Drag playhead (magnetically grabs element starts & ends · Hold Alt to bypass)"
+              className={`pointer-events-auto w-3 h-3 -ml-[5px] rounded-b-sm cursor-ew-resize shadow transition-transform duration-100 ${
+                playheadSnapPulse
+                  ? 'bg-amber-400 scale-125 ring-2 ring-amber-200 shadow-[0_0_10px_rgba(251,191,36,0.95)]'
+                  : 'bg-rose-500'
+              }`}
             />
+
+            {playheadSnapInfo?.snapped && (
+              <div
+                data-testid="playhead-snap-badge"
+                className={`absolute top-0.5 left-3 px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold whitespace-nowrap shadow-lg border pointer-events-none ${
+                  playheadSnapInfo.isMultiAligned
+                    ? 'bg-emerald-500 text-zinc-950 border-emerald-200'
+                    : 'bg-amber-400 text-zinc-950 border-amber-200'
+                }`}
+              >
+                {playheadSnapInfo.isMultiAligned ? 'ALIGNED: ' : 'SNAP: '}
+                {playheadSnapInfo.matchedLabels.slice(0, 3).join(' + ')} ·{' '}
+                {formatTimecode(playheadSnapInfo.time).slice(0, 8)}
+              </div>
+            )}
+
             <button
               type="button"
               onPointerDown={(e) => e.stopPropagation()}

@@ -1,7 +1,16 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { FileText, Film, X, CheckCircle2, AlertCircle } from 'lucide-react';
+import {
+  FileText,
+  Film,
+  X,
+  CheckCircle2,
+  AlertCircle,
+  Image as ImageIcon,
+  Download,
+  Pencil,
+} from 'lucide-react';
 import {
   AspectRatio,
   EnabledTracks,
@@ -19,6 +28,7 @@ import {
   AudioTimelineClip,
   TimedEffectClip,
   VisualTimelineClip,
+  sanitizeProjectFilename,
 } from '@/lib/timeline-engine';
 import {
   EXPORT_QUALITY_PRESETS,
@@ -27,10 +37,17 @@ import {
   exportFullHdVideo,
 } from '@/lib/video-exporter';
 import { UploadedMediaItem } from './MediaBin';
+import { ProjectThumbnails } from './ThumbnailPickerModal';
 
 interface ExportModalProps {
   isOpen: boolean;
   onClose: () => void;
+  projectName: string;
+  onChangeProjectName: (name: string) => void;
+  thumbnails: ProjectThumbnails;
+  onOpenThumbnailPicker: (targetRatio: AspectRatio) => void;
+  includeThumbnailCover: boolean;
+  onToggleIncludeThumbnailCover: (val: boolean) => void;
   ratio: AspectRatio;
   duration: number;
   globalOffset: number;
@@ -54,6 +71,12 @@ interface ExportModalProps {
 export default function ExportModal({
   isOpen,
   onClose,
+  projectName,
+  onChangeProjectName,
+  thumbnails,
+  onOpenThumbnailPicker,
+  includeThumbnailCover,
+  onToggleIncludeThumbnailCover,
   ratio,
   duration,
   globalOffset,
@@ -97,6 +120,8 @@ export default function ExportModal({
   const qualitySpec = EXPORT_QUALITY_PRESETS[quality];
   const hasAudioTrack = Boolean(audioItem?.url || visualItem?.kind === 'video');
   const estSizeMb = estimateExportSizeMb(Math.max(2, duration), quality, hasAudioTrack);
+  const safeBaseName = sanitizeProjectFilename(projectName, 'lyrcut-video');
+  const activeThumb = thumbnails[ratio];
 
   const handleDownloadSrt = () => {
     const srtText = exportToSrt(cues, enabledTracks, globalOffset);
@@ -104,11 +129,21 @@ export default function ExportModal({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `lyrcut-lyrics-${ratio === '16:9' ? 'landscape' : 'portrait'}.srt`;
+    a.download = `${safeBaseName}-${ratio === '16:9' ? 'landscape' : 'portrait'}.srt`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleDownloadThumb = () => {
+    if (!activeThumb) return;
+    const a = document.createElement('a');
+    a.href = activeThumb.dataUrl;
+    a.download = `${safeBaseName}-thumbnail-${ratio === '16:9' ? '16x9' : '9x16'}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   };
 
   const handleStartFullHdExport = async () => {
@@ -175,6 +210,7 @@ export default function ExportModal({
         farsiFontFamily,
         nastaliqFontFamily,
         latinFontFamily: latinFont,
+        coverThumbnailUrl: includeThumbnailCover && activeThumb ? activeThumb.dataUrl : null,
         signal: controller.signal,
         onProgress: (info) => {
           setProgress(info.percent);
@@ -185,7 +221,7 @@ export default function ExportModal({
         },
       });
 
-      const fileName = `lyrcut-${res.width}x${res.height}-${
+      const fileName = `${safeBaseName}-${res.width}x${res.height}-${
         ratio === '16:9' ? 'landscape' : 'portrait'
       }.${result.ext}`;
       const url = URL.createObjectURL(result.blob);
@@ -250,7 +286,115 @@ export default function ExportModal({
           </button>
         </div>
 
-        <div className="p-5 space-y-4">
+        <div className="p-5 space-y-4 max-h-[82vh] overflow-y-auto">
+          {/* Editable Project / Export Filename */}
+          <div className="space-y-1">
+            <label
+              htmlFor="export-project-name-input"
+              className="text-[11px] font-medium text-zinc-400 flex items-center justify-between"
+            >
+              <span className="inline-flex items-center gap-1">
+                <Pencil className="w-3 h-3 text-amber-400" aria-hidden="true" />
+                Project & Export File Name
+              </span>
+              <span className="text-[10px] font-mono text-zinc-500 truncate max-w-[230px]">
+                {safeBaseName}-{res.width}x{res.height}.mp4
+              </span>
+            </label>
+            <input
+              id="export-project-name-input"
+              data-testid="export-project-name-input"
+              type="text"
+              disabled={status === 'rendering'}
+              value={projectName}
+              onChange={(e) => onChangeProjectName(e.target.value)}
+              placeholder="Enter project name..."
+              className="w-full px-3 py-2 text-xs font-medium bg-[#0B0D11] text-zinc-100 rounded-lg border border-white/12 focus:outline-none focus:border-amber-500 disabled:opacity-50"
+            />
+          </div>
+
+          {/* Video Thumbnail Card (Landscape 16:9 & Portrait 9:16) */}
+          <div className="p-3 rounded-lg bg-[#0B0D11] border border-white/8 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <div
+                className="shrink-0 rounded overflow-hidden border border-white/12 bg-[#161A22] flex items-center justify-center"
+                style={
+                  ratio === '16:9'
+                    ? { width: '76px', height: '43px' }
+                    : { width: '36px', height: '64px' }
+                }
+              >
+                {activeThumb ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={activeThumb.dataUrl}
+                    alt={`${ratio} video thumbnail`}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <ImageIcon className="w-4 h-4 text-zinc-600" aria-hidden="true" />
+                )}
+              </div>
+              <div className="min-w-0 space-y-1">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-xs font-semibold text-zinc-100">
+                    {ratio === '16:9' ? 'Landscape (16:9)' : 'Portrait (9:16)'} Thumbnail
+                  </span>
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
+                      thumbnails['16:9']
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : 'bg-white/5 text-zinc-500'
+                    }`}
+                  >
+                    16:9 {thumbnails['16:9'] ? '✓' : '—'}
+                  </span>
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
+                      thumbnails['9:16']
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : 'bg-white/5 text-zinc-500'
+                    }`}
+                  >
+                    9:16 {thumbnails['9:16'] ? '✓' : '—'}
+                  </span>
+                </div>
+                <label className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={!activeThumb || status === 'rendering'}
+                    checked={includeThumbnailCover && Boolean(activeThumb)}
+                    onChange={(e) => onToggleIncludeThumbnailCover(e.target.checked)}
+                    className="accent-amber-500 cursor-pointer"
+                  />
+                  <span>Embed thumbnail as video cover frame</span>
+                </label>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {activeThumb && (
+                <button
+                  type="button"
+                  onClick={handleDownloadThumb}
+                  title="Download Thumbnail PNG"
+                  aria-label="Download Thumbnail PNG"
+                  className="p-1.5 rounded-md bg-[#191D26] hover:bg-[#232936] text-emerald-300 border border-white/10 cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" aria-hidden="true" />
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={status === 'rendering'}
+                data-testid="export-pick-thumbnail-btn"
+                onClick={() => onOpenThumbnailPicker(ratio)}
+                className="px-2.5 py-1.5 text-[11px] font-medium bg-amber-500/18 hover:bg-amber-500/30 text-amber-300 border border-amber-500/35 rounded-md cursor-pointer whitespace-nowrap disabled:opacity-40"
+              >
+                {activeThumb ? 'Change' : 'Set Thumbnail'}
+              </button>
+            </div>
+          </div>
+
           {/* Output Specifications */}
           <div className="grid grid-cols-2 gap-3 text-xs">
             <div className="p-3 rounded-lg bg-[#0B0D11] border border-white/8">

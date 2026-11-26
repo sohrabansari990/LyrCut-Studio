@@ -8,6 +8,9 @@ import {
   Subtitles,
   Layers,
   Sparkles,
+  Image as ImageIcon,
+  Pencil,
+  GripHorizontal,
 } from 'lucide-react';
 import { MotionConfig, motion } from 'motion/react';
 import stageLandscapeImg from '@/src/assets/images/music_studio_stage_landscape_1794862911026.jpg';
@@ -89,6 +92,8 @@ import {
   pasteCuesAtTime,
   pasteTimedClipsAtTime,
   removeLayerKeyframe,
+  sanitizeProjectFilename,
+  shiftSelectedCuesByDelta,
   splitAudioClipAtTime,
   splitEffectClipAtTime,
   splitVisualClipAtTime,
@@ -99,6 +104,10 @@ import PreviewStage from './PreviewStage';
 import LyricsInspector, { EffectsSubTab, InspectorTab } from './LyricsInspector';
 import ExportModal from './ExportModal';
 import ProjectSetupModal, { NewProjectSettings } from './ProjectSetupModal';
+import ThumbnailPickerModal, {
+  ProjectThumbnails,
+  ThumbnailAsset,
+} from './ThumbnailPickerModal';
 import TimelineEditor, {
   TimelineMarker,
   TimelineSelectionItem,
@@ -187,6 +196,7 @@ export default function StudioWorkspace() {
   const [isLooping, setIsLooping] = useState<boolean>(true);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [waveformPeaks, setWaveformPeaks] = useState<number[]>([]);
+  const [waveformPeaksByUrl, setWaveformPeaksByUrl] = useState<Record<string, number[]>>({});
   const [audioAnalysis, setAudioAnalysis] = useState<AudioBeatAnalysis | null>(null);
 
   const [cues, setCues] = useState<LyricCue[]>(() => createSampleCues(24));
@@ -264,8 +274,35 @@ export default function StudioWorkspace() {
   const [hasCreatedProject, setHasCreatedProject] = useState<boolean>(false);
   const [audioAnalysisRevision, setAudioAnalysisRevision] = useState<number>(0);
 
+  // Dual-Ratio Thumbnail Picker (16:9 Landscape & 9:16 Portrait) + Portrait Timeline Resizer
+  const [thumbnails, setThumbnails] = useState<ProjectThumbnails>({
+    '16:9': null,
+    '9:16': null,
+  });
+  const [isThumbnailModalOpen, setIsThumbnailModalOpen] = useState<boolean>(false);
+  const [thumbnailModalRatio, setThumbnailModalRatio] = useState<AspectRatio>('16:9');
+  const [includeThumbnailCover, setIncludeThumbnailCover] = useState<boolean>(true);
+  const [portraitTimelineHeight, setPortraitTimelineHeight] = useState<number>(225);
+  const [isResizingPortraitTimeline, setIsResizingPortraitTimeline] =
+    useState<boolean>(false);
+
   const audioAnalysisMapRef = useRef<Map<string, AudioBeatAnalysis>>(new Map());
   const audioAnalysisPendingRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!isResizingPortraitTimeline) return;
+    const onMove = (e: PointerEvent) => {
+      const nextHeight = Math.max(165, Math.min(420, window.innerHeight - e.clientY));
+      setPortraitTimelineHeight(Math.round(nextHeight));
+    };
+    const onUp = () => setIsResizingPortraitTimeline(false);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, [isResizingPortraitTimeline]);
 
   useEffect(() => {
     if (
@@ -768,6 +805,161 @@ export default function StudioWorkspace() {
     });
   }, []);
 
+  // Capture a clean native-resolution thumbnail (1920x1080 or 1080x1920) from ANY video timestamp
+  const captureFrameThumbnail = useCallback(
+    async (targetRatio: AspectRatio, timestamp: number): Promise<string | null> => {
+      if (typeof document === 'undefined') return null;
+      const res = getResolutionForRatio(targetRatio);
+      const offscreen = document.createElement('canvas');
+      offscreen.width = res.width;
+      offscreen.height = res.height;
+      const ctx = offscreen.getContext('2d', { alpha: false });
+      if (!ctx) return null;
+
+      const hiddenVisualSet = new Set<number>(hiddenVisualTracksRef.current);
+      const clipMediaSources = new Map<string, HTMLImageElement | HTMLVideoElement>();
+      const clipEnvelopeOpacities = new Map<string, number>();
+      const vClips = visualClipsRef.current;
+
+      let mediaSource: CanvasImageSource | null = null;
+      let mediaOpacity = 1;
+      let mediaLayers: StackedMediaLayer[] | undefined = undefined;
+
+      if (vClips.length > 0) {
+        for (const clip of vClips) {
+          let src: HTMLImageElement | HTMLVideoElement | null = null;
+          if (clip.kind === 'image') {
+            src =
+              visualImageCacheRef.current.get(clip.url) ??
+              ((clip.trackIndex ?? 0) === 0 ? loadedImageRef.current : null);
+          } else {
+            src =
+              videoPoolRef.current.get(clip.url) ??
+              ((clip.trackIndex ?? 0) === 0 ? hiddenVideoRef.current : null);
+          }
+          if (src) {
+            clipMediaSources.set(clip.id, src);
+            clipMediaSources.set(clip.url, src);
+          }
+          clipEnvelopeOpacities.set(clip.id, 1);
+        }
+
+        const hits = getActiveVisualClipsAtTime(vClips, timestamp, hiddenVisualSet);
+        const stacked: StackedMediaLayer[] = [];
+        for (const hit of hits) {
+          const src =
+            clipMediaSources.get(hit.clip.id) ?? clipMediaSources.get(hit.clip.url) ?? null;
+          if (!src) continue;
+          if (typeof HTMLVideoElement !== 'undefined' && src instanceof HTMLVideoElement) {
+            const vidDur = Number.isFinite(src.duration) && src.duration > 0 ? src.duration : 1;
+            const targetLocal = hit.localMediaTime % vidDur;
+            if (Math.abs(src.currentTime - targetLocal) > 0.04) {
+              await new Promise<void>((resolve) => {
+                let done = false;
+                const finish = () => {
+                  if (done) return;
+                  done = true;
+                  src.removeEventListener('seeked', finish);
+                  clearTimeout(timer);
+                  resolve();
+                };
+                const timer = setTimeout(finish, 180);
+                src.addEventListener('seeked', finish, { once: true });
+                src.currentTime = targetLocal;
+              });
+            }
+          }
+          stacked.push({
+            source: src,
+            opacity: hit.opacity,
+            trackIndex: hit.trackIndex,
+            fitMode: hit.clip.fitMode,
+          });
+        }
+        mediaLayers = stacked;
+        if (stacked.length > 0) {
+          mediaSource = stacked[0].source;
+          mediaOpacity = stacked[0].opacity;
+        }
+      } else {
+        mediaSource =
+          activeVisualKindRef.current === 'video'
+            ? hiddenVideoRef.current
+            : activeVisualKindRef.current === 'image'
+            ? loadedImageRef.current
+            : null;
+      }
+
+      const { latin: latinFont, farsi: farsiFont, nastaliq: nastaliqFont } =
+        resolvedFontsRef.current;
+
+      let frameAudioAnalysis: AudioBeatAnalysis | null = audioAnalysisRef.current;
+      let frameAudioAnalysisTime = timestamp;
+      const allAudioClips = audioClipsRef.current;
+      if (allAudioClips.length > 0) {
+        const mutedSet = new Set(mutedAudioTracksRef.current);
+        const activeAudioHits = getActiveAudioClipsAtTime(
+          allAudioClips,
+          timestamp,
+          mutedSet
+        );
+        const primaryAudioHit =
+          activeAudioHits.find((h) => h.gain > 0.001) ?? activeAudioHits[0] ?? null;
+        if (primaryAudioHit) {
+          frameAudioAnalysis =
+            audioAnalysisMapRef.current.get(primaryAudioHit.clip.url) ??
+            audioAnalysisRef.current;
+          frameAudioAnalysisTime = primaryAudioHit.localAudioTime;
+        } else {
+          frameAudioAnalysis = null;
+        }
+      }
+
+      const renderLayers =
+        targetRatio === ratioRef.current
+          ? layersRef.current
+          : adaptLayersToRatio(layersRef.current, ratioRef.current, targetRatio);
+
+      renderFrameToCanvas({
+        ctx,
+        width: res.width,
+        height: res.height,
+        ratio: targetRatio,
+        mediaSource,
+        mediaLayers,
+        clipMediaSources,
+        clipEnvelopeOpacities,
+        hiddenVisualTracks: hiddenVisualSet,
+        mediaFit: mediaFitRef.current,
+        mediaOpacity,
+        cues: cuesRef.current,
+        currentTime: timestamp,
+        projectDuration: durationRef.current,
+        globalOffset: globalOffsetRef.current,
+        enabledTracks: enabledTracksRef.current,
+        style: styleRef.current,
+        scrollingConfig: scrollingConfigRef.current,
+        beatEffects: beatEffectsRef.current,
+        effectClips: effectClipsRef.current,
+        audioAnalysis: frameAudioAnalysis,
+        audioAnalysisTime: frameAudioAnalysisTime,
+        layers: renderLayers,
+        layerImages: layerImagesRef.current,
+        selectedLayerId: null,
+        snapGuides: null,
+        farsiFontFamily: farsiFont,
+        nastaliqFontFamily: nastaliqFont,
+        latinFontFamily: latinFont,
+        drawSafeZones: false,
+        drawLayerHandles: false,
+        disableFade: true,
+      });
+
+      return offscreen.toDataURL('image/png');
+    },
+    []
+  );
+
   // Preload all unique image & video URLs referenced by multi-track Visual Timeline
   useEffect(() => {
     const imgCache = visualImageCacheRef.current;
@@ -865,11 +1057,12 @@ export default function StudioWorkspace() {
       audioEl.load();
     }
 
-    extractWaveformPeaks(activeAudioItem.url, 120).then((res) => {
+    extractWaveformPeaks(activeAudioItem.url, 240).then((res) => {
       if (cancelled || !res) return;
       audioAnalysisMapRef.current.set(activeAudioItem.url, res.beatAnalysis);
       audioAnalysisRef.current = res.beatAnalysis;
       setWaveformPeaks(res.peaks);
+      setWaveformPeaksByUrl((prev) => ({ ...prev, [activeAudioItem.url]: res.peaks }));
       setAudioAnalysis(res.beatAnalysis);
       setAudioAnalysisRevision((n) => n + 1);
       drawCanvasFrame(currentTimeRef.current);
@@ -890,7 +1083,7 @@ export default function StudioWorkspace() {
     };
   }, [activeAudioItem, drawCanvasFrame]);
 
-  // Decode beat/frequency envelopes for EVERY unique audio clip on A1..An so multi-track Beat FX always fire
+  // Decode waveforms & beat/frequency envelopes for EVERY unique audio clip on A1..An
   useEffect(() => {
     let cancelled = false;
     const uniqueUrls = Array.from(new Set(audioClips.map((c) => c.url)));
@@ -903,10 +1096,11 @@ export default function StudioWorkspace() {
         return;
       }
       audioAnalysisPendingRef.current.add(url);
-      extractWaveformPeaks(url, 120).then((res) => {
+      extractWaveformPeaks(url, 240).then((res) => {
         audioAnalysisPendingRef.current.delete(url);
         if (cancelled || !res) return;
         audioAnalysisMapRef.current.set(url, res.beatAnalysis);
+        setWaveformPeaksByUrl((prev) => ({ ...prev, [url]: res.peaks }));
         if (!audioAnalysisRef.current) {
           audioAnalysisRef.current = res.beatAnalysis;
           setAudioAnalysis(res.beatAnalysis);
@@ -2786,10 +2980,26 @@ export default function StudioWorkspace() {
         patch.startTime !== undefined ||
         patch.endTime !== undefined ||
         patch.trackIndex !== undefined;
+      const trackChanged =
+        patch.trackIndex !== undefined && patch.trackIndex !== prevTrack;
+      const isLeftTrim =
+        Boolean(prevClip) &&
+        !trackChanged &&
+        patch.sourceStart !== undefined &&
+        Math.abs(patch.sourceStart - (prevClip?.sourceStart ?? 0)) > 0.001;
+      const isRightTrim =
+        Boolean(prevClip) &&
+        !trackChanged &&
+        patch.endTime !== undefined &&
+        (patch.startTime === undefined ||
+          Math.abs(patch.startTime - (prevClip?.startTime ?? 0)) < 0.001) &&
+        Math.abs(patch.endTime - (prevClip?.endTime ?? 0)) > 0.001;
+      const isTrimOnly = isLeftTrim || isRightTrim;
 
       setAudioClips((prev) => {
         let next = prev.map((c) => (c.id === id ? { ...c, ...patch } : c));
-        if (autoRippleRef.current && timingChanged) {
+        // Only auto-ripple when repositioning/moving clips between tracks, NOT when shrinking/trimming a clip
+        if (autoRippleRef.current && timingChanged && !isTrimOnly) {
           const updated = next.find((c) => c.id === id);
           const nextTrack = updated?.trackIndex ?? prevTrack;
           next = closeGapsAfterTrackMove(next, id, nextTrack);
@@ -3022,12 +3232,12 @@ export default function StudioWorkspace() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'lyrcut-synced-lyrics.srt';
+    a.download = `${sanitizeProjectFilename(projectName, 'lyrcut-synced-lyrics')}.srt`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }, []);
+  }, [projectName]);
 
   // Timeline Cue Editing Handlers
   const handlePreviewCueTiming = useCallback(
@@ -3041,6 +3251,25 @@ export default function StudioWorkspace() {
     (beforeCues: LyricCue[], id: string, startTime: number, endTime: number) => {
       pushHistory(cloneSnapshot(beforeCues));
       setCues((prev) => updateCueTiming(prev, id, startTime, endTime));
+    },
+    [cloneSnapshot, pushHistory]
+  );
+
+  const handlePreviewShiftSelectedCues = useCallback(
+    (baseCues: LyricCue[], selectedIds: string[], deltaSec: number) => {
+      setCues(shiftSelectedCuesByDelta(baseCues, new Set(selectedIds), deltaSec));
+    },
+    []
+  );
+
+  const handleCommitShiftSelectedCues = useCallback(
+    (beforeCues: LyricCue[], selectedIds: string[], deltaSec: number) => {
+      if (Math.abs(deltaSec) < 0.001 || selectedIds.length === 0) return;
+      pushHistory(cloneSnapshot(beforeCues));
+      const shifted = shiftSelectedCuesByDelta(beforeCues, new Set(selectedIds), deltaSec);
+      setCues(shifted);
+      const maxEnd = shifted.reduce((m, c) => Math.max(m, c.endTime), durationRef.current);
+      if (maxEnd > durationRef.current) setDuration(Number(maxEnd.toFixed(2)));
     },
     [cloneSnapshot, pushHistory]
   );
@@ -3595,7 +3824,10 @@ export default function StudioWorkspace() {
     onChangeGlobalOffset: setGlobalOffset,
     onPreviewCueTiming: handlePreviewCueTiming,
     onCommitCueTiming: handleCommitCueTiming,
+    onPreviewShiftSelectedCues: handlePreviewShiftSelectedCues,
+    onCommitShiftSelectedCues: handleCommitShiftSelectedCues,
     waveformPeaks,
+    waveformPeaksByUrl,
     activeAudioName: activeAudioItem?.name ?? null,
     markers,
     onAddMarker: (time: number) => {
@@ -3820,8 +4052,8 @@ export default function StudioWorkspace() {
 
         {/* Top Bar Contract: 1-row, 3-zone, icon-first navigation with hover tooltips */}
         <header className="h-12 shrink-0 px-4 sm:px-5 border-b border-white/8 bg-[#0E1117] flex items-center justify-between gap-4 select-none">
-          {/* Zone 1: Brand Wordmark + Project Title */}
-          <div className="flex items-center gap-2.5 min-w-0">
+          {/* Zone 1: Brand Wordmark + Inline Editable Project Name */}
+          <div className="flex items-center gap-2 min-w-0">
             <a
               href="#"
               className="text-base font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0"
@@ -3829,9 +4061,27 @@ export default function StudioWorkspace() {
               LyrCut Studio
             </a>
             <span className="hidden sm:inline-block text-zinc-700">/</span>
-            <span className="hidden sm:inline-block text-xs text-zinc-400 truncate max-w-[160px]">
-              {projectName}
-            </span>
+            <label className="hidden sm:flex items-center gap-1 group min-w-0">
+              <span className="sr-only">Project name</span>
+              <input
+                type="text"
+                data-testid="header-project-name-input"
+                aria-label="Project name"
+                value={projectName}
+                onChange={(e) => setProjectName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    (e.currentTarget as HTMLInputElement).blur();
+                  }
+                }}
+                placeholder="Untitled Lyric Video"
+                className="bg-transparent hover:bg-white/6 focus:bg-[#161A22] text-xs font-medium text-zinc-200 focus:text-white px-2 py-1 rounded border border-transparent hover:border-white/10 focus:border-amber-500/60 focus:outline-none w-[150px] lg:w-[190px] truncate transition-colors select-text"
+              />
+              <Pencil
+                className="w-3 h-3 text-zinc-500 group-hover:text-amber-400 shrink-0 pointer-events-none"
+                aria-hidden="true"
+              />
+            </label>
           </div>
 
           {/* Zone 2: Icon-first Workspace Navigation with Hover Tooltips */}
@@ -3923,8 +4173,33 @@ export default function StudioWorkspace() {
             </IconTooltip>
           </nav>
 
-          {/* Zone 3: New Project + Primary Export Action */}
+          {/* Zone 3: Thumbnail Studio + New Project + Primary Export Action */}
           <div className="flex items-center gap-2 shrink-0">
+            <IconTooltip
+              tip="Set Video Thumbnail (Capture frame or upload custom image for Portrait & Landscape)"
+              position="bottom"
+              align="right"
+            >
+              <button
+                type="button"
+                data-testid="open-thumbnail-btn"
+                aria-label="Set Video Thumbnail"
+                onClick={() => {
+                  if (isPlaying) handleTogglePlay();
+                  setThumbnailModalRatio(ratio);
+                  setIsThumbnailModalOpen(true);
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium border rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  thumbnails[ratio]
+                    ? 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 border-emerald-500/40'
+                    : 'bg-[#161A22] hover:bg-[#1F2530] text-zinc-200 border-white/10'
+                }`}
+              >
+                <ImageIcon className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
+                <span className="hidden lg:inline">Thumbnail</span>
+              </button>
+            </IconTooltip>
+
             <IconTooltip tip="Start a new Portrait (9:16) or Landscape (16:9) project" position="bottom" align="right">
               <button
                 type="button"
@@ -3941,6 +4216,7 @@ export default function StudioWorkspace() {
             <IconTooltip tip="Export 1080p Full HD video with audio & effects" position="bottom" align="right">
               <button
                 type="button"
+                data-testid="open-export-btn"
                 onClick={() => {
                   if (isPlaying) handleTogglePlay();
                   setIsExportOpen(true);
@@ -4044,12 +4320,34 @@ export default function StudioWorkspace() {
                 )}
               </div>
 
-              {/* Bottom-Right Full-Width Timeline */}
+              {/* Draggable Vertical Splitter so Portrait Lyrics Box is ALWAYS generously visible */}
+              <div
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="Resize Portrait Inspector and Timeline"
+                data-testid="portrait-timeline-splitter"
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  setIsResizingPortraitTimeline(true);
+                }}
+                title="Drag up/down to resize Lyrics box vs Timeline"
+                className={`h-2 shrink-0 bg-[#0E1117] hover:bg-amber-500/25 border-t border-white/10 flex items-center justify-center cursor-ns-resize transition-colors ${
+                  isResizingPortraitTimeline ? 'bg-amber-500/35' : ''
+                }`}
+              >
+                <GripHorizontal className="w-4 h-3 text-zinc-500" aria-hidden="true" />
+              </div>
+
+              {/* Bottom-Right Full-Width Timeline (bounded height so upper Lyrics box is NEVER hidden) */}
               <div
                 data-testid="portrait-timeline-slot"
-                className="shrink-0 border-t border-white/8"
+                style={{ maxHeight: `${portraitTimelineHeight}px` }}
+                className="shrink-0 overflow-hidden flex flex-col"
               >
-                <TimelineEditor {...sharedTimelineProps} />
+                <TimelineEditor
+                  {...sharedTimelineProps}
+                  maxBodyHeightPx={Math.max(115, portraitTimelineHeight - 44)}
+                />
               </div>
             </div>
           </motion.main>
@@ -4123,6 +4421,15 @@ export default function StudioWorkspace() {
         <ExportModal
           isOpen={isExportOpen}
           onClose={() => setIsExportOpen(false)}
+          projectName={projectName}
+          onChangeProjectName={setProjectName}
+          thumbnails={thumbnails}
+          onOpenThumbnailPicker={(targetRatio) => {
+            setThumbnailModalRatio(targetRatio);
+            setIsThumbnailModalOpen(true);
+          }}
+          includeThumbnailCover={includeThumbnailCover}
+          onToggleIncludeThumbnailCover={setIncludeThumbnailCover}
           ratio={ratio}
           duration={duration}
           globalOffset={globalOffset}
@@ -4141,6 +4448,21 @@ export default function StudioWorkspace() {
           beatEffects={beatEffects}
           layers={layers}
           layerImages={layerImages}
+        />
+
+        {/* Dual-Ratio Thumbnail Picker Modal (Landscape 16:9 & Portrait 9:16) — stacked above ExportModal */}
+        <ThumbnailPickerModal
+          isOpen={isThumbnailModalOpen}
+          onClose={() => setIsThumbnailModalOpen(false)}
+          initialRatio={thumbnailModalRatio}
+          projectName={projectName}
+          currentTime={currentTime}
+          duration={duration}
+          thumbnails={thumbnails}
+          onCaptureFrame={captureFrameThumbnail}
+          onSetThumbnail={(targetRatio, asset: ThumbnailAsset | null) =>
+            setThumbnails((prev) => ({ ...prev, [targetRatio]: asset }))
+          }
         />
       </div>
     </MotionConfig>

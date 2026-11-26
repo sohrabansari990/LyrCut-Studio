@@ -387,20 +387,59 @@ export default function LyricsInspector({
       />
 
       {activeTab === 'lyrics' && (
-        <div className="flex-1 flex flex-col min-h-0">
-          {/* Clean Browser-Only Lyric Import & Multi-SRT Controls */}
-          <div className="p-2.5 border-b border-white/8 space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] text-zinc-400 truncate">
-                {SOURCE_LABELS[lyricSource]}
-              </span>
-              <div className="flex items-center gap-1">
+        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          {/* Compact Browser-Only Lyric Import, Offset & Track Toggles (keeps Lyrics list prominently visible even in Portrait 9:16 mode) */}
+          <div className="px-2.5 py-2 border-b border-white/8 space-y-1.5 shrink-0 bg-[#10131A]">
+            {/* Row 1: Source badge + FA / RO / EN quick SRT upload + Paste / Export / Clear All */}
+            <div className="flex items-center justify-between gap-1.5 flex-wrap">
+              <div className="flex items-center gap-1 min-w-0">
+                <span className="text-[10px] font-medium text-zinc-400 truncate max-w-[105px]">
+                  {SOURCE_LABELS[lyricSource]}
+                </span>
+                <div className="flex items-center gap-0.5">
+                  <IconTooltip tip="Upload Farsi / Dari .SRT file" position="bottom" align="left">
+                    <button
+                      type="button"
+                      onClick={() => farsiSrtRef.current?.click()}
+                      aria-label="Upload Farsi SRT"
+                      className="inline-flex items-center gap-0.5 px-1.5 py-1 text-[10px] font-medium bg-[#191D26] hover:bg-[#222834] text-zinc-200 rounded border border-white/10 cursor-pointer"
+                    >
+                      <Upload className="w-2.5 h-2.5 text-amber-400" aria-hidden="true" />
+                      <span>FA</span>
+                    </button>
+                  </IconTooltip>
+                  <IconTooltip tip="Upload Romanized .SRT file" position="bottom">
+                    <button
+                      type="button"
+                      onClick={() => romanSrtRef.current?.click()}
+                      aria-label="Upload Roman SRT"
+                      className="inline-flex items-center gap-0.5 px-1.5 py-1 text-[10px] font-medium bg-[#191D26] hover:bg-[#222834] text-zinc-200 rounded border border-white/10 cursor-pointer"
+                    >
+                      <Upload className="w-2.5 h-2.5 text-sky-400" aria-hidden="true" />
+                      <span>RO</span>
+                    </button>
+                  </IconTooltip>
+                  <IconTooltip tip="Upload English .SRT file" position="bottom">
+                    <button
+                      type="button"
+                      onClick={() => englishSrtRef.current?.click()}
+                      aria-label="Upload English SRT"
+                      className="inline-flex items-center gap-0.5 px-1.5 py-1 text-[10px] font-medium bg-[#191D26] hover:bg-[#222834] text-zinc-200 rounded border border-white/10 cursor-pointer"
+                    >
+                      <Upload className="w-2.5 h-2.5 text-emerald-400" aria-hidden="true" />
+                      <span>EN</span>
+                    </button>
+                  </IconTooltip>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1 shrink-0">
                 <IconTooltip tip="Paste or edit multi-language lyrics" position="bottom">
                   <button
                     type="button"
                     onClick={() => setShowImporter((v) => !v)}
                     aria-label={showImporter ? 'Close Paste / Edit' : 'Paste / Edit Lyrics'}
-                    className={`p-1.5 rounded-md transition-colors cursor-pointer ${
+                    className={`p-1 rounded transition-colors cursor-pointer ${
                       showImporter
                         ? 'bg-amber-500 text-zinc-950'
                         : 'bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 border border-amber-500/30'
@@ -415,7 +454,7 @@ export default function LyricsInspector({
                     onClick={onExportCorrectedSrt}
                     disabled={cues.length === 0}
                     aria-label="Export SRT"
-                    className="p-1.5 bg-[#191D26] hover:bg-[#232936] disabled:opacity-40 text-amber-400 rounded-md border border-white/10 cursor-pointer"
+                    className="p-1 bg-[#191D26] hover:bg-[#232936] disabled:opacity-40 text-amber-400 rounded border border-white/10 cursor-pointer"
                   >
                     <Download className="w-3.5 h-3.5" aria-hidden="true" />
                   </button>
@@ -427,50 +466,13 @@ export default function LyricsInspector({
                     disabled={cues.length === 0}
                     aria-label="Delete all lyrics at once"
                     data-testid="delete-all-lyrics-btn"
-                    className="inline-flex items-center gap-1 px-2 py-1.5 text-[10px] font-medium bg-rose-500/12 hover:bg-rose-500/25 disabled:opacity-40 text-rose-300 rounded-md border border-rose-500/30 cursor-pointer"
+                    className="inline-flex items-center gap-1 px-1.5 py-1 text-[10px] font-medium bg-rose-500/12 hover:bg-rose-500/25 disabled:opacity-40 text-rose-300 rounded border border-rose-500/30 cursor-pointer"
                   >
                     <Trash2 className="w-3 h-3" aria-hidden="true" />
                     <span>All</span>
                   </button>
                 </IconTooltip>
               </div>
-            </div>
-
-            {/* Compact SRT Track Uploads */}
-            <div className="grid grid-cols-3 gap-1">
-              <IconTooltip tip="Upload Farsi / Dari .SRT file" position="bottom" align="left">
-                <button
-                  type="button"
-                  onClick={() => farsiSrtRef.current?.click()}
-                  aria-label="Upload Farsi SRT"
-                  className="w-full inline-flex items-center justify-center gap-1 px-2 py-1.5 text-[10px] font-medium bg-[#191D26] hover:bg-[#222834] text-zinc-200 rounded-md border border-white/10 cursor-pointer"
-                >
-                  <Upload className="w-3 h-3 text-amber-400" aria-hidden="true" />
-                  <span>FA</span>
-                </button>
-              </IconTooltip>
-              <IconTooltip tip="Upload Romanized .SRT file" position="bottom">
-                <button
-                  type="button"
-                  onClick={() => romanSrtRef.current?.click()}
-                  aria-label="Upload Roman SRT"
-                  className="w-full inline-flex items-center justify-center gap-1 px-2 py-1.5 text-[10px] font-medium bg-[#191D26] hover:bg-[#222834] text-zinc-200 rounded-md border border-white/10 cursor-pointer"
-                >
-                  <Upload className="w-3 h-3 text-sky-400" aria-hidden="true" />
-                  <span>RO</span>
-                </button>
-              </IconTooltip>
-              <IconTooltip tip="Upload English .SRT file" position="bottom" align="right">
-                <button
-                  type="button"
-                  onClick={() => englishSrtRef.current?.click()}
-                  aria-label="Upload English SRT"
-                  className="w-full inline-flex items-center justify-center gap-1 px-2 py-1.5 text-[10px] font-medium bg-[#191D26] hover:bg-[#222834] text-zinc-200 rounded-md border border-white/10 cursor-pointer"
-                >
-                  <Upload className="w-3 h-3 text-emerald-400" aria-hidden="true" />
-                  <span>EN</span>
-                </button>
-              </IconTooltip>
 
               <input
                 ref={farsiSrtRef}
@@ -518,7 +520,7 @@ export default function LyricsInspector({
 
             {/* Expandable Paste / Manual Text Drawer */}
             {showImporter && (
-              <div className="p-2.5 rounded-lg bg-[#0B0D11] border border-white/10 space-y-2">
+              <div className="p-2 rounded-lg bg-[#0B0D11] border border-white/10 space-y-1.5">
                 <div className="flex items-center justify-between gap-2">
                   <label
                     htmlFor="import-mode-select"
@@ -543,7 +545,7 @@ export default function LyricsInspector({
                 <textarea
                   value={rawLyrics}
                   onChange={(e) => setRawLyrics(e.target.value)}
-                  rows={5}
+                  rows={4}
                   aria-label="Paste lyrics in Farsi, Roman, English, or SRT format"
                   placeholder="Paste Farsi/Dari lyrics, SRT content, or multi-language lines like:&#10;شب یلدا | Shab-e yalda | Solstice night"
                   className="w-full rounded-lg bg-[#12151C] border border-white/10 p-2 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500 leading-relaxed"
@@ -570,7 +572,7 @@ export default function LyricsInspector({
                   <button
                     type="button"
                     onClick={handleApplyRaw}
-                    className="px-3 py-1.5 text-xs font-semibold bg-amber-500 text-zinc-950 rounded-md hover:bg-amber-400 cursor-pointer"
+                    className="px-3 py-1 text-xs font-semibold bg-amber-500 text-zinc-950 rounded-md hover:bg-amber-400 cursor-pointer"
                   >
                     Apply to Timeline
                   </button>
@@ -578,18 +580,14 @@ export default function LyricsInspector({
               </div>
             )}
 
-            {/* Global Offset Control (non-destructive preview & export offset) */}
-            <div className="p-2 rounded-lg bg-[#0E1117] border border-white/8 space-y-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-medium text-zinc-300">
-                  Global Timing Offset
-                </span>
-                <span className="text-[11px] font-mono tabular-nums text-amber-300">
+            {/* Row 2: Compact Inline Global Offset + Track Visibility Toggles */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <div className="flex items-center gap-0.5 bg-[#0B0D11] border border-white/8 rounded px-1.5 py-0.5">
+                <span className="text-[10px] text-zinc-400 mr-0.5">Offset</span>
+                <span className="text-[10px] font-mono tabular-nums text-amber-300 mr-1">
                   {globalOffset >= 0 ? '+' : ''}
-                  {globalOffset.toFixed(2)}s ({Math.round(globalOffset * 1000)}ms)
+                  {globalOffset.toFixed(2)}s
                 </span>
-              </div>
-              <div className="flex items-center gap-1">
                 {[-0.25, 0, 0.25].map((preset) => (
                   <button
                     key={preset}
@@ -599,7 +597,7 @@ export default function LyricsInspector({
                         preset === 0 ? 0 : Number((globalOffset + preset).toFixed(2))
                       )
                     }
-                    className="flex-1 py-1 text-[10px] font-mono tabular-nums rounded bg-[#191D26] hover:bg-[#232936] text-zinc-200 border border-white/8 cursor-pointer"
+                    className="px-1.5 py-0.5 text-[9px] font-mono tabular-nums rounded bg-[#191D26] hover:bg-[#232936] text-zinc-200 border border-white/8 cursor-pointer"
                   >
                     {preset === 0 ? '0s' : preset > 0 ? `+${preset}s` : `${preset}s`}
                   </button>
@@ -628,21 +626,49 @@ export default function LyricsInspector({
                       setOffsetDraft('');
                     }
                   }}
-                  className="w-14 px-1.5 py-1 text-[10px] font-mono bg-[#090B0F] text-zinc-200 rounded border border-white/10 focus:outline-none focus:border-amber-500"
+                  className="w-10 px-1 py-0.5 text-[9px] font-mono bg-[#090B0F] text-zinc-200 rounded border border-white/10 focus:outline-none focus:border-amber-500"
                 />
+              </div>
+
+              <div className="flex-1 grid grid-cols-3 gap-1 min-w-[175px]">
+                {(
+                  [
+                    { key: 'primary', label: 'Farsi' },
+                    { key: 'roman', label: 'Roman' },
+                    { key: 'english', label: 'English' },
+                  ] as const
+                ).map((t) => {
+                  const active = enabledTracks[t.key];
+                  return (
+                    <button
+                      key={t.key}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => onToggleTrack(t.key)}
+                      className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-1 text-[10px] font-medium rounded border transition-colors whitespace-nowrap cursor-pointer ${
+                        active
+                          ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                          : 'bg-[#0B0D11] border-white/8 text-zinc-500 hover:text-zinc-300'
+                      }`}
+                    >
+                      {active && <Check className="w-2.5 h-2.5" aria-hidden="true" />}
+                      <span>{t.label}</span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
             {/* Validation Warnings (non-blocking) */}
             {validationWarnings.length > 0 && (
-              <div className="rounded-lg bg-amber-500/10 border border-amber-500/30 p-2 text-[11px]">
+              <div className="rounded-lg bg-amber-500/10 border border-amber-500/30 px-2 py-1 text-[10px]">
                 <button
                   type="button"
                   onClick={() => setShowWarnings((v) => !v)}
                   className="w-full flex items-center justify-between text-amber-200 font-medium cursor-pointer"
                 >
                   <span className="inline-flex items-center gap-1.5">
-                    <AlertTriangle className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
+                    <AlertTriangle className="w-3 h-3 text-amber-400" aria-hidden="true" />
                     <span>
                       {validationWarnings.length}{' '}
                       {validationWarnings.length === 1 ? 'warning' : 'warnings'}
@@ -653,7 +679,7 @@ export default function LyricsInspector({
                   </span>
                 </button>
                 {showWarnings && (
-                  <ul className="mt-1.5 space-y-1 max-h-24 overflow-y-auto text-[10px] text-amber-100/85">
+                  <ul className="mt-1 space-y-0.5 max-h-20 overflow-y-auto text-[10px] text-amber-100/85">
                     {validationWarnings.slice(0, 6).map((w) => (
                       <li key={w.id} className="leading-snug">
                         • {w.message}
@@ -663,39 +689,10 @@ export default function LyricsInspector({
                 )}
               </div>
             )}
-
-            {/* Track Visibility Toggles */}
-            <div className="grid grid-cols-3 gap-1.5">
-              {(
-                [
-                  { key: 'primary', label: 'Farsi / Dari' },
-                  { key: 'roman', label: 'Romanized' },
-                  { key: 'english', label: 'English' },
-                ] as const
-              ).map((t) => {
-                const active = enabledTracks[t.key];
-                return (
-                  <button
-                    key={t.key}
-                    type="button"
-                    aria-pressed={active}
-                    onClick={() => onToggleTrack(t.key)}
-                    className={`inline-flex items-center justify-center gap-1 px-1.5 py-1.5 text-[11px] font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
-                      active
-                        ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
-                        : 'bg-[#0B0D11] border-white/8 text-zinc-500 hover:text-zinc-300'
-                    }`}
-                  >
-                    {active && <Check className="w-3 h-3" aria-hidden="true" />}
-                    <span>{t.label}</span>
-                  </button>
-                );
-              })}
-            </div>
           </div>
 
-          {/* Cue List */}
-          <div className="flex-1 overflow-y-auto p-3 space-y-2" data-testid="cue-list">
+          {/* Cue List — always min-h-0 flex-1 overflow-y-auto so lyric cards stay visible above timeline */}
+          <div className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-2" data-testid="cue-list">
             {cues.length === 0 ? (
               <div className="py-10 px-4 text-center">
                 <p className="text-sm font-medium text-zinc-300">No lyrics loaded</p>

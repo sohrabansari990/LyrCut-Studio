@@ -922,3 +922,278 @@ export function extendFullTimelineImageClips(
   });
 }
 
+/**
+ * Trims/shrinks the left edge of an audio clip to isolate a specific desired section of a song.
+ * Advances `sourceStart` in lockstep with `startTime` so audio playback starts at the exact trimmed point.
+ */
+export function trimAudioClipLeft(
+  clip: AudioTimelineClip,
+  candidateStartTime: number
+): Pick<AudioTimelineClip, 'startTime' | 'endTime' | 'sourceStart' | 'fadeIn' | 'fadeOut'> {
+  const minDur = 0.25;
+  const maxStart = Math.max(0, clip.endTime - minDur);
+  // Cannot trim earlier than sourceStart === 0 (start of audio file)
+  const minStartFromSource = Math.max(0, clip.startTime - clip.sourceStart);
+  const nextStart = Number(
+    clamp(candidateStartTime, minStartFromSource, maxStart).toFixed(2)
+  );
+  const shift = nextStart - clip.startTime;
+  const nextSourceStart = Number(Math.max(0, clip.sourceStart + shift).toFixed(2));
+  const nextDur = Math.max(minDur, clip.endTime - nextStart);
+  return {
+    startTime: nextStart,
+    endTime: clip.endTime,
+    sourceStart: nextSourceStart,
+    fadeIn: Number(Math.min(clip.fadeIn, nextDur * 0.5).toFixed(2)),
+    fadeOut: Number(Math.min(clip.fadeOut, nextDur * 0.5).toFixed(2)),
+  };
+}
+
+/**
+ * Trims/shrinks the right edge of an audio clip to keep only the desired section of the song.
+ */
+export function trimAudioClipRight(
+  clip: AudioTimelineClip,
+  candidateEndTime: number
+): Pick<AudioTimelineClip, 'startTime' | 'endTime' | 'sourceStart' | 'fadeIn' | 'fadeOut'> {
+  const minDur = 0.25;
+  const minEnd = clip.startTime + minDur;
+  const maxEnd =
+    clip.sourceDuration > 0.25
+      ? Math.max(minEnd, clip.startTime + Math.max(minDur, clip.sourceDuration - clip.sourceStart))
+      : Math.max(minEnd, candidateEndTime);
+  const nextEnd = Number(clamp(candidateEndTime, minEnd, maxEnd).toFixed(2));
+  const nextDur = Math.max(minDur, nextEnd - clip.startTime);
+  return {
+    startTime: clip.startTime,
+    endTime: nextEnd,
+    sourceStart: clip.sourceStart,
+    fadeIn: Number(Math.min(clip.fadeIn, nextDur * 0.5).toFixed(2)),
+    fadeOut: Number(Math.min(clip.fadeOut, nextDur * 0.5).toFixed(2)),
+  };
+}
+
+/**
+ * Slices and resamples a full audio file's decoded waveform peaks to the exact trimmed
+ * `[sourceStart, sourceStart + clipDuration]` window so shrinking/cutting shows the true waveform.
+ */
+export function sliceWaveformPeaksForClip(
+  peaks: number[],
+  sourceStart: number,
+  clipDuration: number,
+  sourceDuration: number,
+  targetBars = 96
+): number[] {
+  const barCount = Math.max(8, Math.min(240, Math.round(targetBars)));
+  if (!peaks || peaks.length === 0) {
+    return Array.from({ length: barCount }, (_, i) => {
+      const wave = 0.28 + 0.35 * Math.abs(Math.sin(i * 0.42)) + 0.18 * Math.abs(Math.cos(i * 0.19));
+      return Number(clamp(wave, 0.12, 0.92).toFixed(3));
+    });
+  }
+
+  const totalDur = sourceDuration > 0.1 ? sourceDuration : Math.max(0.25, clipDuration);
+  const startFrac = clamp(sourceStart / totalDur, 0, 0.995);
+  const endFrac = clamp((sourceStart + Math.max(0.1, clipDuration)) / totalDur, startFrac + 0.005, 1);
+
+  const startIdx = startFrac * (peaks.length - 1);
+  const endIdx = endFrac * (peaks.length - 1);
+  const span = Math.max(0.001, endIdx - startIdx);
+
+  const result: number[] = [];
+  for (let b = 0; b < barCount; b++) {
+    const f0 = startIdx + (b / barCount) * span;
+    const f1 = startIdx + ((b + 1) / barCount) * span;
+    const i0 = Math.max(0, Math.floor(f0));
+    const i1 = Math.min(peaks.length - 1, Math.max(i0, Math.ceil(f1)));
+    let maxVal = 0;
+    for (let j = i0; j <= i1; j++) {
+      if (peaks[j] > maxVal) maxVal = peaks[j];
+    }
+    result.push(Number(clamp(maxVal, 0.08, 1).toFixed(3)));
+  }
+  return result;
+}
+
+/**
+ * Returns IDs of all lyric cues overlapping the marquee-dragged time range `[tA, tB]`.
+ */
+export function selectCuesInTimeRange(
+  cues: LyricCue[],
+  timeA: number,
+  timeB: number
+): string[] {
+  const minT = Math.min(timeA, timeB);
+  const maxT = Math.max(timeA, timeB);
+  return cues
+    .filter((cue) => cue.endTime >= minT && cue.startTime <= maxT)
+    .map((cue) => cue.id);
+}
+
+/**
+ * Shifts all selected lyric cues forward or backward together by `deltaSec`,
+ * preserving exact relative spacing between selected lines while keeping all startTimes >= 0.
+ */
+export function shiftSelectedCuesByDelta(
+  cues: LyricCue[],
+  selectedIds: Set<string>,
+  deltaSec: number
+): LyricCue[] {
+  if (selectedIds.size === 0 || !Number.isFinite(deltaSec) || Math.abs(deltaSec) < 0.0001) {
+    return cues;
+  }
+  let minStart = Number.POSITIVE_INFINITY;
+  for (const cue of cues) {
+    if (selectedIds.has(cue.id)) {
+      minStart = Math.min(minStart, cue.startTime);
+    }
+  }
+  if (!Number.isFinite(minStart)) return cues;
+
+  // Clamp delta so earliest selected cue cannot go before 00:00
+  const clampedDelta = Math.max(-minStart, deltaSec);
+  return cues
+    .map((cue) => {
+      if (!selectedIds.has(cue.id)) return cue;
+      const len = Math.max(0.2, cue.endTime - cue.startTime);
+      const nextStart = Number(Math.max(0, cue.startTime + clampedDelta).toFixed(2));
+      const nextEnd = Number((nextStart + len).toFixed(2));
+      return { ...cue, startTime: nextStart, endTime: nextEnd };
+    })
+    .sort((a, b) => a.startTime - b.startTime);
+}
+
+export interface PlayheadSnapResult {
+  time: number;
+  snapped: boolean;
+  matchedLabels: string[];
+  isMultiAligned: boolean;
+}
+
+/**
+ * Magnetically snaps the red playhead pin to the start or end of any timeline element
+ * (visual clips, audio clips, FX clips, lyric cues, markers) and reports all elements
+ * aligned at that timestamp so the user can confirm simultaneous endings across tracks.
+ */
+export function snapPlayheadToElements(params: {
+  candidateTime: number;
+  thresholdSec: number;
+  visualClips: VisualTimelineClip[];
+  audioClips: AudioTimelineClip[];
+  effectClips: TimedEffectClip[];
+  cues: LyricCue[];
+  markers: Array<{ time: number; label?: string }>;
+  maxDuration: number;
+}): PlayheadSnapResult {
+  const {
+    candidateTime,
+    thresholdSec,
+    visualClips,
+    audioClips,
+    effectClips,
+    cues,
+    markers,
+    maxDuration,
+  } = params;
+  const clamped = clamp(candidateTime, 0, Math.max(0.5, maxDuration));
+
+  const anchors: Array<{ time: number; label: string }> = [{ time: 0, label: 'Start' }];
+
+  for (const clip of visualClips) {
+    const trackLabel = `V${(clip.trackIndex ?? 0) + 1}`;
+    anchors.push({ time: roundTime(clip.startTime), label: `${trackLabel} Start` });
+    anchors.push({ time: roundTime(clip.endTime), label: `${trackLabel} End` });
+  }
+  for (const clip of audioClips) {
+    const trackLabel = `A${(clip.trackIndex ?? 0) + 1}`;
+    anchors.push({ time: roundTime(clip.startTime), label: `${trackLabel} Start` });
+    anchors.push({ time: roundTime(clip.endTime), label: `${trackLabel} End` });
+  }
+  for (const fx of effectClips) {
+    anchors.push({ time: roundTime(fx.startTime), label: 'FX Start' });
+    anchors.push({ time: roundTime(fx.endTime), label: 'FX End' });
+  }
+  if (cues.length > 0) {
+    // Always include first lyric start and last lyric end, plus individual cue edges
+    for (let i = 0; i < cues.length; i++) {
+      const c = cues[i];
+      anchors.push({ time: roundTime(c.startTime), label: `Lyric #${i + 1} Start` });
+      anchors.push({ time: roundTime(c.endTime), label: `Lyric #${i + 1} End` });
+    }
+  }
+  for (const m of markers) {
+    anchors.push({ time: roundTime(m.time), label: m.label || 'Marker' });
+  }
+
+  let bestDiff = thresholdSec + 0.0001;
+  let bestTime: number | null = null;
+
+  for (let i = 0; i < anchors.length; i++) {
+    const diff = Math.abs(clamped - anchors[i].time);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestTime = anchors[i].time;
+    }
+  }
+
+  if (bestTime === null) {
+    return {
+      time: Number(clamped.toFixed(2)),
+      snapped: false,
+      matchedLabels: [],
+      isMultiAligned: false,
+    };
+  }
+
+  // Gather ALL elements aligned within ±0.06s of the snapped timestamp
+  const labelSet = new Set<string>();
+  for (let i = 0; i < anchors.length; i++) {
+    if (Math.abs(anchors[i].time - bestTime) <= 0.06) {
+      labelSet.add(anchors[i].label);
+    }
+  }
+  const matchedLabels = Array.from(labelSet);
+  const elementMatches = matchedLabels.filter((l) => l !== 'Start');
+
+  return {
+    time: Number(clamp(bestTime, 0, Math.max(0.5, maxDuration)).toFixed(2)),
+    snapped: true,
+    matchedLabels,
+    isMultiAligned: elementMatches.length >= 2,
+  };
+}
+
+/**
+ * Picks a clean timeline ruler tick interval so timestamp labels never overlap horizontally.
+ */
+export function computeRulerTickStep(
+  displayDuration: number,
+  trackPixelWidth: number,
+  minLabelSpacingPx = 64
+): number {
+  const safeDur = Math.max(1, displayDuration);
+  const safePx = Math.max(100, trackPixelWidth);
+  const secPerPx = safeDur / safePx;
+  const minStepSec = secPerPx * minLabelSpacingPx;
+  const candidates = [0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 300];
+  for (const step of candidates) {
+    if (step >= minStepSec) return step;
+  }
+  return 300;
+}
+
+/**
+ * Sanitizes any user project title into a clean cross-platform export filename slug.
+ */
+export function sanitizeProjectFilename(name: string, fallback = 'lyrcut-project'): string {
+  const cleaned = (name || '')
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 72);
+  return cleaned || fallback;
+}
+
+

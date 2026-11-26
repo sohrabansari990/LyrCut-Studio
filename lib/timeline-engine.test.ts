@@ -8,6 +8,7 @@ import {
   closeTrackGaps,
   collectTimelineSnapTargets,
   computeEnvelopeGain,
+  computeRulerTickStep,
   computeTimelineDisplayDuration,
   evaluateLayerAtTime,
   extendFullTimelineImageClips,
@@ -22,11 +23,18 @@ import {
   pasteTimedClipsAtTime,
   removeLayerKeyframe,
   resolveBeatEffectsAtTime,
+  sanitizeProjectFilename,
+  selectCuesInTimeRange,
+  shiftSelectedCuesByDelta,
+  sliceWaveformPeaksForClip,
   snapClipEdgeToTargets,
   snapClipMoveToTargets,
+  snapPlayheadToElements,
   splitAudioClipAtTime,
   splitEffectClipAtTime,
   splitVisualClipAtTime,
+  trimAudioClipLeft,
+  trimAudioClipRight,
   upsertLayerKeyframe,
 } from './timeline-engine';
 import { DEFAULT_BEAT_EFFECTS_CONFIG } from './beat-effects';
@@ -493,5 +501,119 @@ test('extendFullTimelineImageClips auto-extends full-length still images when so
   assert.equal(extended[0].endTime, 185.4);
   assert.equal(extended[1].endTime, 10);
 });
+
+test('trimAudioClipLeft and trimAudioClipRight isolate a specific desired section and slice waveform accurately', () => {
+  const clip: AudioTimelineClip = {
+    id: 'a1',
+    mediaId: 'm1',
+    name: 'Full Song.mp3',
+    url: 'blob:song',
+    trackIndex: 0,
+    startTime: 0,
+    endTime: 160,
+    sourceStart: 0,
+    sourceDuration: 160,
+    fadeIn: 4,
+    fadeOut: 4,
+    volume: 1,
+  };
+
+  // Shrink left edge to 40s (isolated starting at 0:40 of source audio)
+  const leftTrimmed = trimAudioClipLeft(clip, 40);
+  assert.equal(leftTrimmed.startTime, 40);
+  assert.equal(leftTrimmed.sourceStart, 40);
+  assert.equal(leftTrimmed.endTime, 160);
+
+  // Shrink right edge to 65s (keeping only 25s chorus from 0:40 -> 1:05)
+  const chorus = trimAudioClipRight({ ...clip, ...leftTrimmed }, 65);
+  assert.equal(chorus.startTime, 40);
+  assert.equal(chorus.endTime, 65);
+  assert.equal(chorus.sourceStart, 40);
+
+  // Waveform peaks slice accurately to [40s..65s] out of 160s
+  const fullPeaks = Array.from({ length: 160 }, (_, i) => (i >= 40 && i <= 65 ? 0.95 : 0.1));
+  const sliced = sliceWaveformPeaksForClip(fullPeaks, 40, 25, 160, 20);
+  assert.equal(sliced.length, 20);
+  assert.ok(sliced.every((v) => v >= 0.9), 'expected chorus slice to extract high-energy peaks');
+});
+
+test('selectCuesInTimeRange marquee selection and shiftSelectedCuesByDelta group move work together', () => {
+  const cues: LyricCue[] = [
+    { id: 'c1', startTime: 50, endTime: 54, primary: 'Line 1', roman: '', english: '' },
+    { id: 'c2', startTime: 55, endTime: 59, primary: 'Line 2', roman: '', english: '' },
+    { id: 'c3', startTime: 60, endTime: 64, primary: 'Line 3', roman: '', english: '' },
+    { id: 'c4', startTime: 80, endTime: 85, primary: 'Line 4', roman: '', english: '' },
+  ];
+
+  const picked = selectCuesInTimeRange(cues, 52, 62);
+  assert.deepEqual(picked, ['c1', 'c2', 'c3']);
+
+  // Slide selected lyrics backward by -50s so Line 1 starts at 00:00 matching trimmed audio
+  const movedBack = shiftSelectedCuesByDelta(cues, new Set(picked), -50);
+  assert.equal(movedBack[0].startTime, 0);
+  assert.equal(movedBack[0].endTime, 4);
+  assert.equal(movedBack[1].startTime, 5);
+  assert.equal(movedBack[2].startTime, 10);
+  // Unselected Line 4 stays untouched
+  assert.equal(movedBack[3].startTime, 80);
+
+  // Attempting to push past 0 clamps cleanly without distorting relative spacing
+  const clamped = shiftSelectedCuesByDelta(movedBack, new Set(['c1', 'c2']), -20);
+  assert.equal(clamped[0].startTime, 0);
+  assert.equal(clamped[1].startTime, 5);
+});
+
+test('snapPlayheadToElements magnetically grabs clip boundaries and flags simultaneous endings', () => {
+  const vClip: VisualTimelineClip = {
+    id: 'v1',
+    mediaId: 'm1',
+    name: 'BG',
+    kind: 'image',
+    url: 'blob:bg',
+    trackIndex: 0,
+    startTime: 0,
+    endTime: 24,
+    sourceStart: 0,
+    sourceDuration: 0,
+    fadeIn: 0,
+    fadeOut: 0,
+  };
+  const aClip: AudioTimelineClip = {
+    id: 'a1',
+    mediaId: 'm2',
+    name: 'Song',
+    url: 'blob:song',
+    trackIndex: 0,
+    startTime: 0,
+    endTime: 24,
+    sourceStart: 0,
+    sourceDuration: 24,
+    fadeIn: 0,
+    fadeOut: 0,
+    volume: 1,
+  };
+
+  const hit = snapPlayheadToElements({
+    candidateTime: 23.85,
+    thresholdSec: 0.35,
+    visualClips: [vClip],
+    audioClips: [aClip],
+    effectClips: [],
+    cues: [],
+    markers: [],
+    maxDuration: 45,
+  });
+
+  assert.equal(hit.snapped, true);
+  assert.equal(hit.time, 24);
+  assert.equal(hit.isMultiAligned, true);
+  assert.ok(hit.matchedLabels.includes('V1 End'));
+  assert.ok(hit.matchedLabels.includes('A1 End'));
+
+  // Dynamic ruler spacing & filename sanitization
+  assert.ok(computeRulerTickStep(300, 600, 64) >= 30);
+  assert.equal(sanitizeProjectFilename('My Farsi Song: 2026!'), 'My-Farsi-Song-2026!');
+});
+
 
 

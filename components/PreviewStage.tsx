@@ -178,7 +178,18 @@ interface PreviewStageProps {
     startTime: number,
     endTime: number
   ) => void;
+  onPreviewShiftSelectedCues: (
+    baseCues: LyricCue[],
+    selectedIds: string[],
+    deltaSec: number
+  ) => void;
+  onCommitShiftSelectedCues: (
+    beforeCues: LyricCue[],
+    selectedIds: string[],
+    deltaSec: number
+  ) => void;
   waveformPeaks: number[];
+  waveformPeaksByUrl?: Record<string, number[]>;
   activeAudioName: string | null;
   markers: TimelineMarker[];
   onAddMarker: (time: number) => void;
@@ -190,6 +201,7 @@ interface PreviewStageProps {
   autoRipple: boolean;
   onToggleAutoRipple: () => void;
   hideTimeline?: boolean;
+  maxBodyHeightPx?: number;
 }
 
 type CanvasInteraction = {
@@ -293,7 +305,10 @@ export default function PreviewStage({
   onChangeGlobalOffset,
   onPreviewCueTiming,
   onCommitCueTiming,
+  onPreviewShiftSelectedCues,
+  onCommitShiftSelectedCues,
   waveformPeaks,
+  waveformPeaksByUrl,
   activeAudioName,
   markers,
   onAddMarker,
@@ -305,6 +320,7 @@ export default function PreviewStage({
   autoRipple,
   onToggleAutoRipple,
   hideTimeline = false,
+  maxBodyHeightPx,
 }: PreviewStageProps) {
   const [interaction, setInteraction] = useState<CanvasInteraction | null>(null);
   const [canvasSnapEnabled, setCanvasSnapEnabled] = useState<boolean>(true);
@@ -1174,6 +1190,7 @@ export default function PreviewStage({
           selectedCueId={selectedCueId}
           syncTargetIndex={syncTargetIndex}
           waveformPeaks={waveformPeaks}
+          waveformPeaksByUrl={waveformPeaksByUrl}
           activeAudioName={activeAudioName}
           markers={markers}
           canUndo={canUndo}
@@ -1186,12 +1203,15 @@ export default function PreviewStage({
           onChangeGlobalOffset={onChangeGlobalOffset}
           onPreviewCueTiming={onPreviewCueTiming}
           onCommitCueTiming={onCommitCueTiming}
+          onPreviewShiftSelectedCues={onPreviewShiftSelectedCues}
+          onCommitShiftSelectedCues={onCommitShiftSelectedCues}
           onAddMarker={onAddMarker}
           onRemoveMarker={onRemoveMarker}
           onUndo={onUndo}
           onRedo={onRedo}
           autoRipple={autoRipple}
           onToggleAutoRipple={onToggleAutoRipple}
+          maxBodyHeightPx={maxBodyHeightPx}
         />
       )}
     </section>
